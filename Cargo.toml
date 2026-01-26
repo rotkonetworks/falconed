@@ -1,0 +1,42 @@
+[package]
+name = "falconed"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+description = "hybrid post-quantum signatures: ed25519 + falcon-512"
+repository = "https://github.com/rotkonetworks/falconed"
+keywords = ["cryptography", "signatures", "post-quantum", "ed25519", "falcon"]
+categories = ["cryptography", "no-std"]
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = ["ed25519-dalek/std"]
+serde = ["dep:serde", "ed25519-dalek/serde"]
+zeroize = ["dep:zeroize", "ed25519-dalek/zeroize"]
+# avx2 acceleration for falcon on x86_64
+simd = ["fn-dsa/shake256x4"]
+
+[dependencies]
+ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"] }
+fn-dsa = { version = "0.3", default-features = false }
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
+subtle = { version = "2.5", default-features = false }
+
+serde = { version = "1", default-features = false, features = ["derive"], optional = true }
+zeroize = { version = "1.7", default-features = false, features = ["derive"], optional = true }
+
+[dev-dependencies]
+rand = "0.8"
+hex-literal = "0.4"
+criterion = "0.5"
+proptest = "1.4"
+
+[[bench]]
+name = "bench"
+harness = false
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
