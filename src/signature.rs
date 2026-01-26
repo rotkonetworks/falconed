@@ -4,12 +4,16 @@ use crate::error::Error;
 use crate::{ED25519_SIGNATURE_SIZE, FALCON_SIGNATURE_SIZE, SIGNATURE_SIZE};
 
 use ed25519_dalek::Signature as Ed25519Signature;
-use subtle::ConstantTimeEq;
+use signature::SignatureEncoding;
 
 /// hybrid signature: ed25519 + falcon-512.
 ///
 /// contains both signatures over the same message.
 /// both must verify for the combined signature to be valid.
+///
+/// individual signature components are not exposed to prevent
+/// partial verification. use [`crate::VerifyingKey::verify`] to
+/// verify the complete hybrid signature.
 #[derive(Clone)]
 pub struct Signature {
     ed25519: Ed25519Signature,
@@ -27,7 +31,7 @@ impl Signature {
 
     /// serialize the signature to bytes.
     ///
-    /// format: `ed25519_sig (64) || falcon_sig`
+    /// format: `ed25519_sig (64) || falcon_sig (666)`
     pub fn to_bytes(&self) -> [u8; SIGNATURE_SIZE] {
         let mut out = [0u8; SIGNATURE_SIZE];
 
@@ -51,13 +55,13 @@ impl Signature {
         Ok(Self { ed25519, falcon })
     }
 
-    /// access the inner ed25519 signature.
-    pub fn ed25519(&self) -> &Ed25519Signature {
+    /// access the ed25519 component (internal use only).
+    pub(crate) fn ed25519(&self) -> &Ed25519Signature {
         &self.ed25519
     }
 
-    /// access the inner falcon signature bytes.
-    pub fn falcon(&self) -> &[u8; FALCON_SIGNATURE_SIZE] {
+    /// access the falcon component (internal use only).
+    pub(crate) fn falcon(&self) -> &[u8; FALCON_SIGNATURE_SIZE] {
         &self.falcon
     }
 }
@@ -65,9 +69,8 @@ impl Signature {
 impl core::fmt::Debug for Signature {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Signature")
-            .field("ed25519", &hex_preview(&self.ed25519.to_bytes()))
-            .field("falcon", &hex_preview(&self.falcon[..32]))
-            .finish()
+            .field("bytes", &SIGNATURE_SIZE)
+            .finish_non_exhaustive()
     }
 }
 
@@ -83,36 +86,31 @@ impl TryFrom<&[u8]> for Signature {
     }
 }
 
+// signatures are public values - no need for constant-time comparison
 impl PartialEq for Signature {
     fn eq(&self, other: &Self) -> bool {
-        self.to_bytes().ct_eq(&other.to_bytes()).into()
+        self.to_bytes() == other.to_bytes()
     }
 }
 
 impl Eq for Signature {}
 
-/// hex preview for debug output
-fn hex_preview(bytes: &[u8]) -> alloc::string::String {
-    use alloc::format;
-    if bytes.len() <= 8 {
-        hex_encode(bytes)
-    } else {
-        format!(
-            "{}..{}",
-            hex_encode(&bytes[..4]),
-            hex_encode(&bytes[bytes.len() - 4..])
-        )
+impl From<Signature> for [u8; SIGNATURE_SIZE] {
+    fn from(sig: Signature) -> Self {
+        sig.to_bytes()
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> alloc::string::String {
-    use alloc::string::String;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use core::fmt::Write;
-        let _ = write!(s, "{:02x}", b);
+impl TryFrom<[u8; SIGNATURE_SIZE]> for Signature {
+    type Error = Error;
+
+    fn try_from(bytes: [u8; SIGNATURE_SIZE]) -> Result<Self, Self::Error> {
+        Self::from_bytes(&bytes)
     }
-    s
+}
+
+impl SignatureEncoding for Signature {
+    type Repr = [u8; SIGNATURE_SIZE];
 }
 
 #[cfg(feature = "serde")]
@@ -145,6 +143,19 @@ impl<'de> serde::Deserialize<'de> for Signature {
                 E: serde::de::Error,
             {
                 Signature::try_from(v).map_err(E::custom)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut bytes = [0u8; SIGNATURE_SIZE];
+                for (i, byte) in bytes.iter_mut().enumerate() {
+                    *byte = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
+                }
+                Signature::from_bytes(&bytes).map_err(serde::de::Error::custom)
             }
         }
 
