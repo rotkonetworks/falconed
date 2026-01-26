@@ -25,14 +25,30 @@ use rand_core::OsRng;
 
 // generate a keypair
 let sk = SigningKey::generate(&mut OsRng);
-let pk = sk.verifying_key();
+let pk = sk.verifying_key().unwrap();
 
 // sign a message
 let msg = b"the quick brown fox";
-let sig = sk.sign(msg);
+let sig = sk.sign(msg).unwrap();
 
 // verify
 assert!(pk.verify(msg, &sig).is_ok());
+```
+
+## signature crate interop
+
+implements `signature::Signer` and `signature::Verifier`:
+
+```rust
+use signature::{Signer, Verifier};
+use falconed::SigningKey;
+use rand_core::OsRng;
+
+let sk = SigningKey::generate(&mut OsRng);
+let pk = sk.verifying_key().unwrap();
+
+let sig = sk.try_sign(b"message").unwrap();
+assert!(pk.verify(b"message", &sig).is_ok());
 ```
 
 ## serialization
@@ -54,13 +70,14 @@ what you expect.
 checking falcon. this is faster and leaks nothing—verification is a
 public operation on public inputs.
 
-`verify_strict()` checks both regardless for constant-time behavior.
+`verify_strict()` always checks both signatures regardless of the first
+result.
 
 ```rust
 // fast path (default)
 pk.verify(msg, &sig)?;
 
-// constant-time (both always checked)
+// both always checked
 pk.verify_strict(msg, &sig)?;
 ```
 
@@ -72,7 +89,8 @@ default = ["std"]
 std = []
 serde = ["dep:serde"]
 zeroize = ["dep:zeroize"]
-simd = []  # avx2 acceleration on x86_64
+hazmat = []  # expose internal key components
+simd = []    # avx2 acceleration on x86_64
 ```
 
 ## no_std
@@ -83,6 +101,23 @@ disable default features. requires `alloc`.
 [dependencies]
 falconed = { version = "0.1", default-features = false }
 ```
+
+## security considerations
+
+**hybrid construction**: this crate concatenates independent ed25519 and
+falcon-512 signatures. an attacker must break *both* schemes to forge a
+signature. this is a standard construction but has not been formally
+analyzed for this specific pairing.
+
+**timing**: signing operations aim to be constant-time, but this depends
+on the underlying implementations (ed25519-dalek, fn-dsa). verification
+is explicitly *not* constant-time—it operates on public inputs only.
+
+**zeroization**: secret key material is zeroized on drop. decoded falcon
+signing keys are zeroized after each operation.
+
+**not audited**: this implementation has not been professionally audited.
+use at your own risk for anything important.
 
 ## benchmarks
 
