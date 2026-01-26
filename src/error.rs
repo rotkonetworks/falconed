@@ -5,10 +5,10 @@ use core::fmt;
 /// signature verification or key parsing error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
-    /// ed25519 signature verification failed.
-    Ed25519Verification,
-    /// falcon signature verification failed.
-    FalconVerification,
+    /// signature verification failed.
+    ///
+    /// intentionally does not reveal which component (ed25519 or falcon) failed.
+    VerificationFailed,
     /// invalid ed25519 key bytes.
     InvalidEd25519Key,
     /// invalid falcon key bytes.
@@ -22,8 +22,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Ed25519Verification => write!(f, "ed25519 signature verification failed"),
-            Error::FalconVerification => write!(f, "falcon signature verification failed"),
+            Error::VerificationFailed => write!(f, "signature verification failed"),
             Error::InvalidEd25519Key => write!(f, "invalid ed25519 key"),
             Error::InvalidFalconKey => write!(f, "invalid falcon key"),
             Error::InvalidSignature => write!(f, "invalid signature"),
