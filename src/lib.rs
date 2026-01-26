@@ -13,14 +13,31 @@
 //!
 //! // generate a keypair
 //! let sk = SigningKey::generate(&mut OsRng);
-//! let pk = sk.verifying_key();
+//! let pk = sk.verifying_key().unwrap();
 //!
 //! // sign a message
 //! let msg = b"the quick brown fox";
-//! let sig = sk.sign(msg);
+//! let sig = sk.sign(msg).unwrap();
 //!
 //! // verify
 //! assert!(pk.verify(msg, &sig).is_ok());
+//! ```
+//!
+//! ## signature crate interop
+//!
+//! implements [`signature::Signer`] and [`signature::Verifier`] for
+//! compatibility with generic code:
+//!
+//! ```
+//! use signature::{Signer, Verifier};
+//! use falconed::SigningKey;
+//! use rand_core::OsRng;
+//!
+//! let sk = SigningKey::generate(&mut OsRng);
+//! let pk = sk.verifying_key().unwrap();
+//!
+//! let sig = sk.try_sign(b"message").unwrap();
+//! assert!(pk.verify(b"message", &sig).is_ok());
 //! ```
 //!
 //! ## serialization
@@ -37,11 +54,34 @@
 //!
 //! uses [fn-dsa](https://crates.io/crates/fn-dsa) by thomas pornin,
 //! the original author of falcon. pure rust, no C bindings.
+//!
+//! ## security considerations
+//!
+//! **hybrid construction**: this crate concatenates independent ed25519 and
+//! falcon-512 signatures. the security argument is that an attacker must
+//! break *both* schemes to forge a signature. this is a standard construction
+//! but has not been formally analyzed for this specific pairing.
+//!
+//! **timing**: signing operations aim to be constant-time, but this depends
+//! on the underlying implementations (ed25519-dalek, fn-dsa). verification
+//! is explicitly *not* constant-time - it operates on public inputs only.
+//! [`VerifyingKey::verify_strict`] always runs both verifications but does
+//! not guarantee constant-time execution.
+//!
+//! **zeroization**: secret key material is zeroized on drop. decoded falcon
+//! signing keys are zeroized after each operation. ed25519-dalek handles its
+//! own zeroization internally.
+//!
+//! **rng requirements**: key generation and signing require a cryptographically
+//! secure random number generator. falcon signing uses randomness for each
+//! signature.
+//!
+//! **not audited**: this implementation has not been professionally audited.
+//! use at your own risk for anything important.
 
 #![no_std]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_docs)]
-#![deny(unsafe_code)]
 #![warn(clippy::all)]
 
 #[cfg(feature = "std")]
@@ -58,6 +98,9 @@ pub use error::Error;
 pub use signature::Signature;
 pub use signing::SigningKey;
 pub use verifying::VerifyingKey;
+
+// re-export signature traits for convenience
+pub use ::signature::{Signer, Verifier};
 
 use fn_dsa::{sign_key_size, vrfy_key_size, signature_size, FN_DSA_LOGN_512};
 
@@ -96,10 +139,10 @@ mod tests {
     fn roundtrip_sign_verify() {
         let mut rng = rand::thread_rng();
         let sk = SigningKey::generate(&mut rng);
-        let pk = sk.verifying_key();
+        let pk = sk.verifying_key().unwrap();
 
         let msg = b"test message";
-        let sig = sk.sign(msg);
+        let sig = sk.sign(msg).unwrap();
 
         assert!(pk.verify(msg, &sig).is_ok());
     }
@@ -108,9 +151,9 @@ mod tests {
     fn wrong_message_fails() {
         let mut rng = rand::thread_rng();
         let sk = SigningKey::generate(&mut rng);
-        let pk = sk.verifying_key();
+        let pk = sk.verifying_key().unwrap();
 
-        let sig = sk.sign(b"correct message");
+        let sig = sk.sign(b"correct message").unwrap();
         assert!(pk.verify(b"wrong message", &sig).is_err());
     }
 
@@ -118,7 +161,7 @@ mod tests {
     fn serialization_roundtrip() {
         let mut rng = rand::thread_rng();
         let sk = SigningKey::generate(&mut rng);
-        let pk = sk.verifying_key();
+        let pk = sk.verifying_key().unwrap();
 
         let sk_bytes = sk.to_bytes();
         let sk2 = SigningKey::from_bytes(&sk_bytes).unwrap();
@@ -128,7 +171,7 @@ mod tests {
         let pk2 = VerifyingKey::from_bytes(&pk_bytes).unwrap();
         assert_eq!(pk_bytes, pk2.to_bytes());
 
-        let sig = sk.sign(b"test");
+        let sig = sk.sign(b"test").unwrap();
         let sig_bytes = sig.to_bytes();
         let sig2 = Signature::from_bytes(&sig_bytes).unwrap();
         assert_eq!(sig_bytes, sig2.to_bytes());
@@ -138,10 +181,10 @@ mod tests {
     fn verify_strict_succeeds() {
         let mut rng = rand::thread_rng();
         let sk = SigningKey::generate(&mut rng);
-        let pk = sk.verifying_key();
+        let pk = sk.verifying_key().unwrap();
 
         let msg = b"test message";
-        let sig = sk.sign(msg);
+        let sig = sk.sign(msg).unwrap();
 
         assert!(pk.verify_strict(msg, &sig).is_ok());
     }
@@ -150,9 +193,9 @@ mod tests {
     fn verify_strict_fails_on_wrong_message() {
         let mut rng = rand::thread_rng();
         let sk = SigningKey::generate(&mut rng);
-        let pk = sk.verifying_key();
+        let pk = sk.verifying_key().unwrap();
 
-        let sig = sk.sign(b"correct");
+        let sig = sk.sign(b"correct").unwrap();
         assert!(pk.verify_strict(b"wrong", &sig).is_err());
     }
 
@@ -160,9 +203,9 @@ mod tests {
     fn empty_message() {
         let mut rng = rand::thread_rng();
         let sk = SigningKey::generate(&mut rng);
-        let pk = sk.verifying_key();
+        let pk = sk.verifying_key().unwrap();
 
-        let sig = sk.sign(b"");
+        let sig = sk.sign(b"").unwrap();
         assert!(pk.verify(b"", &sig).is_ok());
     }
 
@@ -172,8 +215,8 @@ mod tests {
         let sk1 = SigningKey::generate(&mut rng);
         let sk2 = SigningKey::generate(&mut rng);
 
-        let sig = sk1.sign(b"message");
-        let pk2 = sk2.verifying_key();
+        let sig = sk1.sign(b"message").unwrap();
+        let pk2 = sk2.verifying_key().unwrap();
 
         assert!(pk2.verify(b"message", &sig).is_err());
     }
@@ -182,9 +225,9 @@ mod tests {
     fn bitflip_signature_fails() {
         let mut rng = rand::thread_rng();
         let sk = SigningKey::generate(&mut rng);
-        let pk = sk.verifying_key();
+        let pk = sk.verifying_key().unwrap();
 
-        let sig = sk.sign(b"test");
+        let sig = sk.sign(b"test").unwrap();
         let mut sig_bytes = sig.to_bytes();
 
         // flip a bit in the ed25519 portion
@@ -211,13 +254,13 @@ mod tests {
     fn verifying_key_equality() {
         let mut rng = rand::thread_rng();
         let sk = SigningKey::generate(&mut rng);
-        let pk1 = sk.verifying_key();
-        let pk2 = sk.verifying_key();
+        let pk1 = sk.verifying_key().unwrap();
+        let pk2 = sk.verifying_key().unwrap();
 
         assert_eq!(pk1, pk2);
 
         let sk2 = SigningKey::generate(&mut rng);
-        let pk3 = sk2.verifying_key();
+        let pk3 = sk2.verifying_key().unwrap();
         assert_ne!(pk1, pk3);
     }
 
@@ -226,14 +269,28 @@ mod tests {
         let mut rng = rand::thread_rng();
         let sk = SigningKey::generate(&mut rng);
 
-        let sig1 = sk.sign(b"msg");
-        let sig2 = sk.sign(b"msg");
+        let sig1 = sk.sign(b"msg").unwrap();
+        let sig2 = sk.sign(b"msg").unwrap();
 
         // falcon signatures have randomness, so these may differ
         // but signing the same message twice should at least verify
-        let pk = sk.verifying_key();
+        let pk = sk.verifying_key().unwrap();
         assert!(pk.verify(b"msg", &sig1).is_ok());
         assert!(pk.verify(b"msg", &sig2).is_ok());
+    }
+
+    #[test]
+    fn signature_trait_interop() {
+        use ::signature::Signer as _;
+
+        let mut rng = rand::thread_rng();
+        let sk = SigningKey::generate(&mut rng);
+        let pk = sk.verifying_key().unwrap();
+
+        // test Signer trait
+        let sig = sk.try_sign(b"test").unwrap();
+        // verify using our method (Verifier trait delegates to it)
+        assert!(pk.verify(b"test", &sig).is_ok());
     }
 }
 
@@ -247,9 +304,9 @@ mod proptests {
         fn sign_then_verify_always_succeeds(msg in prop::collection::vec(any::<u8>(), 0..1024)) {
             let mut rng = rand::thread_rng();
             let sk = SigningKey::generate(&mut rng);
-            let pk = sk.verifying_key();
+            let pk = sk.verifying_key().unwrap();
 
-            let sig = sk.sign(&msg);
+            let sig = sk.sign(&msg).unwrap();
             prop_assert!(pk.verify(&msg, &sig).is_ok());
         }
 
@@ -262,9 +319,9 @@ mod proptests {
 
             let mut rng = rand::thread_rng();
             let sk = SigningKey::generate(&mut rng);
-            let pk = sk.verifying_key();
+            let pk = sk.verifying_key().unwrap();
 
-            let sig = sk.sign(&msg1);
+            let sig = sk.sign(&msg1).unwrap();
             prop_assert!(pk.verify(&msg2, &sig).is_err());
         }
 
@@ -275,9 +332,9 @@ mod proptests {
         ) {
             let mut rng = rand::thread_rng();
             let sk = SigningKey::generate(&mut rng);
-            let pk = sk.verifying_key();
+            let pk = sk.verifying_key().unwrap();
 
-            let sig = sk.sign(&msg);
+            let sig = sk.sign(&msg).unwrap();
             let mut sig_bytes = sig.to_bytes();
 
             // flip a bit in ed25519 portion (bytes 0..64)
@@ -304,7 +361,7 @@ mod proptests {
         fn serialization_roundtrip_verifying_key(_seed in any::<u8>()) {
             let mut rng = rand::thread_rng();
             let sk = SigningKey::generate(&mut rng);
-            let pk = sk.verifying_key();
+            let pk = sk.verifying_key().unwrap();
 
             let bytes = pk.to_bytes();
             let pk2 = VerifyingKey::from_bytes(&bytes).unwrap();
