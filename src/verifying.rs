@@ -6,7 +6,6 @@ use crate::{ED25519_PUBLIC_KEY_SIZE, FALCON_PUBLIC_KEY_SIZE, VERIFYING_KEY_SIZE}
 
 use ed25519_dalek::VerifyingKey as Ed25519VerifyingKey;
 use fn_dsa::{VerifyingKey as FnDsaVerifyingKey, VerifyingKey512, DOMAIN_NONE, HASH_ID_RAW};
-use subtle::ConstantTimeEq;
 
 /// hybrid verifying key: ed25519 + falcon-512.
 ///
@@ -20,9 +19,8 @@ pub struct VerifyingKey {
 impl core::fmt::Debug for VerifyingKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("VerifyingKey")
-            .field("ed25519", &self.ed25519)
-            .field("falcon_pk", &"[..]")
-            .finish()
+            .field("bytes", &VERIFYING_KEY_SIZE)
+            .finish_non_exhaustive()
     }
 }
 
@@ -38,54 +36,60 @@ impl VerifyingKey {
     /// verify a signature over a message.
     ///
     /// checks ed25519 first. if it fails, returns early without checking falcon.
-    /// this is faster and leaks nothing—verification is a public operation.
+    /// this is faster and leaks nothing—verification is a public operation on
+    /// public inputs.
     ///
-    /// if you want constant-time verification (both always checked), use
-    /// [`verify_strict`](Self::verify_strict).
+    /// use [`verify_strict`](Self::verify_strict) if you need both signatures
+    /// to always be checked regardless of the first result.
     pub fn verify(&self, msg: &[u8], sig: &Signature) -> Result<(), Error> {
         use ed25519_dalek::Verifier;
 
         // ed25519 first - fast path
         self.ed25519
             .verify(msg, sig.ed25519())
-            .map_err(|_| Error::Ed25519Verification)?;
+            .map_err(|_| Error::VerificationFailed)?;
 
         // then falcon
         let falcon_vk: VerifyingKey512 = FnDsaVerifyingKey::decode(&self.falcon_pk)
             .ok_or(Error::InvalidFalconKey)?;
 
         if !falcon_vk.verify(sig.falcon(), &DOMAIN_NONE, &HASH_ID_RAW, msg) {
-            return Err(Error::FalconVerification);
+            return Err(Error::VerificationFailed);
         }
 
         Ok(())
     }
 
-    /// verify a signature in constant time.
+    /// verify a signature, always checking both components.
     ///
-    /// both ed25519 and falcon signatures are always verified, regardless of
-    /// whether either fails. use this if you need to avoid timing side channels
-    /// on verification failure (unusual but sometimes wanted).
+    /// both ed25519 and falcon signatures are verified regardless of
+    /// whether either fails.
+    ///
+    /// # timing
+    ///
+    /// this method always executes both verification algorithms, but the
+    /// underlying implementations (ed25519-dalek, fn-dsa) may not be
+    /// constant-time for invalid signatures. do not rely on this for
+    /// timing-sensitive applications without auditing the dependencies.
     pub fn verify_strict(&self, msg: &[u8], sig: &Signature) -> Result<(), Error> {
         use ed25519_dalek::Verifier;
 
-        let ed_result = self.ed25519.verify(msg, sig.ed25519());
+        let ed_ok = self.ed25519.verify(msg, sig.ed25519()).is_ok();
 
-        let falcon_result = FnDsaVerifyingKey::decode(&self.falcon_pk)
+        let falcon_ok = FnDsaVerifyingKey::decode(&self.falcon_pk)
             .map(|vk: VerifyingKey512| vk.verify(sig.falcon(), &DOMAIN_NONE, &HASH_ID_RAW, msg))
             .unwrap_or(false);
 
-        // check both, return first error
-        match (ed_result, falcon_result) {
-            (Err(_), _) => Err(Error::Ed25519Verification),
-            (_, false) => Err(Error::FalconVerification),
-            (Ok(()), true) => Ok(()),
+        if ed_ok && falcon_ok {
+            Ok(())
+        } else {
+            Err(Error::VerificationFailed)
         }
     }
 
     /// serialize the verifying key to bytes.
     ///
-    /// format: `ed25519_pk (32) || falcon_pk`
+    /// format: `ed25519_pk (32) || falcon_pk (897)`
     pub fn to_bytes(&self) -> [u8; VERIFYING_KEY_SIZE] {
         let mut out = [0u8; VERIFYING_KEY_SIZE];
 
@@ -113,22 +117,21 @@ impl VerifyingKey {
 
         Ok(Self { ed25519, falcon_pk })
     }
+}
 
+/// hazmat: direct access to internal key components.
+///
+/// these methods expose raw cryptographic keys. misuse can compromise security.
+/// only use if you know exactly what you're doing.
+#[cfg(feature = "hazmat")]
+impl VerifyingKey {
     /// access the inner ed25519 verifying key.
-    ///
-    /// # hazmat
-    ///
-    /// this exposes the raw ed25519 key. you probably don't need this.
-    pub fn ed25519(&self) -> &Ed25519VerifyingKey {
+    pub fn ed25519_key(&self) -> &Ed25519VerifyingKey {
         &self.ed25519
     }
 
     /// access the inner falcon public key bytes.
-    ///
-    /// # hazmat
-    ///
-    /// this exposes the raw falcon key bytes. you probably don't need this.
-    pub fn falcon_public_key(&self) -> &[u8; FALCON_PUBLIC_KEY_SIZE] {
+    pub fn falcon_public_key_bytes(&self) -> &[u8; FALCON_PUBLIC_KEY_SIZE] {
         &self.falcon_pk
     }
 }
@@ -145,13 +148,26 @@ impl TryFrom<&[u8]> for VerifyingKey {
     }
 }
 
+// public keys are public values - no need for constant-time comparison
 impl PartialEq for VerifyingKey {
     fn eq(&self, other: &Self) -> bool {
-        self.to_bytes().ct_eq(&other.to_bytes()).into()
+        self.to_bytes() == other.to_bytes()
     }
 }
 
 impl Eq for VerifyingKey {}
+
+impl core::hash::Hash for VerifyingKey {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.to_bytes().hash(state);
+    }
+}
+
+impl signature::Verifier<crate::Signature> for VerifyingKey {
+    fn verify(&self, msg: &[u8], signature: &crate::Signature) -> Result<(), signature::Error> {
+        self.verify(msg, signature).map_err(|_| signature::Error::new())
+    }
+}
 
 #[cfg(feature = "serde")]
 impl serde::Serialize for VerifyingKey {
@@ -183,6 +199,19 @@ impl<'de> serde::Deserialize<'de> for VerifyingKey {
                 E: serde::de::Error,
             {
                 VerifyingKey::try_from(v).map_err(E::custom)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut bytes = [0u8; VERIFYING_KEY_SIZE];
+                for (i, byte) in bytes.iter_mut().enumerate() {
+                    *byte = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
+                }
+                VerifyingKey::from_bytes(&bytes).map_err(serde::de::Error::custom)
             }
         }
 
