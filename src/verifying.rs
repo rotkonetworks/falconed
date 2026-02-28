@@ -5,7 +5,7 @@ use crate::signature::Signature;
 use crate::{ED25519_PUBLIC_KEY_SIZE, FALCON_PUBLIC_KEY_SIZE, VERIFYING_KEY_SIZE};
 
 use ed25519_dalek::VerifyingKey as Ed25519VerifyingKey;
-use fn_dsa::{VerifyingKey as FnDsaVerifyingKey, VerifyingKey512, DOMAIN_NONE, HASH_ID_RAW};
+use fn_dsa::{VerifyingKey as FnDsaVerifyingKey, VerifyingKey512, HASH_ID_RAW};
 
 /// hybrid verifying key: ed25519 + falcon-512.
 ///
@@ -24,6 +24,15 @@ impl core::fmt::Debug for VerifyingKey {
     }
 }
 
+impl core::fmt::Display for VerifyingKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for byte in &self.to_bytes() {
+            write!(f, "{:02x}", byte)?;
+        }
+        Ok(())
+    }
+}
+
 impl VerifyingKey {
     /// construct a verifying key from its component parts.
     pub(crate) fn from_parts(
@@ -39,21 +48,22 @@ impl VerifyingKey {
     /// this is faster and leaks nothing—verification is a public operation on
     /// public inputs.
     ///
-    /// use [`verify_strict`](Self::verify_strict) if you need both signatures
+    /// use [`verify_all`](Self::verify_all) if you need both signatures
     /// to always be checked regardless of the first result.
     pub fn verify(&self, msg: &[u8], sig: &Signature) -> Result<(), Error> {
         use ed25519_dalek::Verifier;
 
         // ed25519 first - fast path
+        let ed_msg = crate::tagged_message(crate::ED25519_DOMAIN_TAG, msg);
         self.ed25519
-            .verify(msg, sig.ed25519())
+            .verify(&ed_msg, sig.ed25519())
             .map_err(|_| Error::VerificationFailed)?;
 
         // then falcon
         let falcon_vk: VerifyingKey512 = FnDsaVerifyingKey::decode(&self.falcon_pk)
             .ok_or(Error::InvalidFalconKey)?;
 
-        if !falcon_vk.verify(sig.falcon(), &DOMAIN_NONE, &HASH_ID_RAW, msg) {
+        if !falcon_vk.verify(sig.falcon(), &crate::FALCON_DOMAIN_CTX, &HASH_ID_RAW, msg) {
             return Err(Error::VerificationFailed);
         }
 
@@ -71,13 +81,14 @@ impl VerifyingKey {
     /// underlying implementations (ed25519-dalek, fn-dsa) may not be
     /// constant-time for invalid signatures. do not rely on this for
     /// timing-sensitive applications without auditing the dependencies.
-    pub fn verify_strict(&self, msg: &[u8], sig: &Signature) -> Result<(), Error> {
+    pub fn verify_all(&self, msg: &[u8], sig: &Signature) -> Result<(), Error> {
         use ed25519_dalek::Verifier;
 
-        let ed_ok = self.ed25519.verify(msg, sig.ed25519()).is_ok();
+        let ed_msg = crate::tagged_message(crate::ED25519_DOMAIN_TAG, msg);
+        let ed_ok = self.ed25519.verify(&ed_msg, sig.ed25519()).is_ok();
 
         let falcon_ok = FnDsaVerifyingKey::decode(&self.falcon_pk)
-            .map(|vk: VerifyingKey512| vk.verify(sig.falcon(), &DOMAIN_NONE, &HASH_ID_RAW, msg))
+            .map(|vk: VerifyingKey512| vk.verify(sig.falcon(), &crate::FALCON_DOMAIN_CTX, &HASH_ID_RAW, msg))
             .unwrap_or(false);
 
         if ed_ok && falcon_ok {

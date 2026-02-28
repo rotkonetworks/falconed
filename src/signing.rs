@@ -3,13 +3,14 @@
 use crate::error::Error;
 use crate::signature::Signature;
 use crate::verifying::VerifyingKey;
-use crate::{ED25519_SEED_SIZE, FALCON_PUBLIC_KEY_SIZE, FALCON_SECRET_KEY_SIZE, FALCON_SIGNATURE_SIZE, SIGNING_KEY_SIZE};
+use crate::{ED25519_SEED_SIZE, FALCON_PUBLIC_KEY_SIZE, FALCON_SECRET_KEY_SIZE, FALCON_SIGNATURE_SIZE, SEED_SIZE, SIGNING_KEY_SIZE};
 
 use ed25519_dalek::SigningKey as Ed25519SigningKey;
 use fn_dsa::{
     KeyPairGenerator, KeyPairGenerator512, SigningKey as FnDsaSigningKey,
-    SigningKey512, FN_DSA_LOGN_512, DOMAIN_NONE, HASH_ID_RAW,
+    SigningKey512, FN_DSA_LOGN_512, HASH_ID_RAW,
 };
+use sha2::{Sha512, Digest};
 
 // note: SigningKey512 derives ZeroizeOnDrop, so decoded keys are
 // automatically zeroized when they go out of scope.
@@ -29,21 +30,78 @@ pub struct SigningKey {
 
 impl SigningKey {
     /// generate a new signing key from a csprng.
+    ///
+    /// draws 32 bytes from the rng as a master seed, then derives
+    /// independent ed25519 and falcon keys via [`from_seed`](Self::from_seed).
     pub fn generate<R>(csprng: &mut R) -> Self
     where
         R: rand_core::CryptoRng + rand_core::RngCore,
     {
-        let ed25519 = Ed25519SigningKey::generate(csprng);
+        let mut seed = [0u8; SEED_SIZE];
+        csprng.fill_bytes(&mut seed);
+        let key = Self::from_seed(&seed);
+
+        // zeroize the seed on the stack
+        for byte in seed.iter_mut() {
+            unsafe { core::ptr::write_volatile(byte, 0) };
+        }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        key
+    }
+
+    /// derive a signing key deterministically from a 32-byte master seed.
+    ///
+    /// the seed is expanded via SHA-512 into independent keying material:
+    /// - ed25519 seed = `SHA-512("falconed-ed25519" || master)[0..32]`
+    /// - falcon rng seed = `SHA-512("falconed-falcon" || master)[0..32]`
+    ///
+    /// the master seed is not stored — [`to_bytes`](Self::to_bytes) returns
+    /// the expanded `ed25519_seed || falcon_sk`. callers who need the seed
+    /// for backup or derivation must store it themselves.
+    pub fn from_seed(seed: &[u8; SEED_SIZE]) -> Self {
+        use rand_chacha::rand_core::SeedableRng;
+
+        // derive ed25519 seed
+        let ed_hash = Sha512::new()
+            .chain_update(b"falconed-ed25519")
+            .chain_update(seed)
+            .finalize();
+        let mut ed_seed = [0u8; 32];
+        ed_seed.copy_from_slice(&ed_hash[..32]);
+        let ed25519 = Ed25519SigningKey::from_bytes(&ed_seed);
+
+        // derive falcon rng seed
+        let falcon_hash = Sha512::new()
+            .chain_update(b"falconed-falcon")
+            .chain_update(seed)
+            .finalize();
+        let mut falcon_rng_seed = [0u8; 32];
+        falcon_rng_seed.copy_from_slice(&falcon_hash[..32]);
+        let mut falcon_rng = rand_chacha::ChaCha20Rng::from_seed(falcon_rng_seed);
 
         let mut falcon_sk = [0u8; FALCON_SECRET_KEY_SIZE];
         let mut falcon_pk = [0u8; FALCON_PUBLIC_KEY_SIZE];
-
         let mut kg = KeyPairGenerator512::default();
-        kg.keygen(FN_DSA_LOGN_512, csprng, &mut falcon_sk, &mut falcon_pk);
+        kg.keygen(FN_DSA_LOGN_512, &mut falcon_rng, &mut falcon_sk, &mut falcon_pk);
 
-        // falcon_pk is discarded - we derive it on demand from falcon_sk
+        // zeroize intermediates
+        for byte in ed_seed.iter_mut().chain(falcon_rng_seed.iter_mut()) {
+            unsafe { core::ptr::write_volatile(byte, 0) };
+        }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
         Self { ed25519, falcon_sk }
+    }
+
+    /// derive a signing key from a seed slice.
+    ///
+    /// # errors
+    ///
+    /// returns [`Error::InvalidLength`] if the slice is not exactly 32 bytes.
+    pub fn from_seed_slice(seed: &[u8]) -> Result<Self, Error> {
+        let seed: &[u8; SEED_SIZE] = seed.try_into().map_err(|_| Error::InvalidLength)?;
+        Ok(Self::from_seed(seed))
     }
 
     /// sign a message.
@@ -69,13 +127,14 @@ impl SigningKey {
     {
         use ed25519_dalek::Signer;
 
-        let ed_sig = self.ed25519.sign(msg);
+        let ed_msg = crate::tagged_message(crate::ED25519_DOMAIN_TAG, msg);
+        let ed_sig = self.ed25519.sign(&ed_msg);
 
         let mut falcon_signer: SigningKey512 = FnDsaSigningKey::decode(&self.falcon_sk)
             .ok_or(Error::InvalidFalconKey)?;
 
         let mut falcon_sig = [0u8; FALCON_SIGNATURE_SIZE];
-        falcon_signer.sign(rng, &DOMAIN_NONE, &HASH_ID_RAW, msg, &mut falcon_sig);
+        falcon_signer.sign(rng, &crate::FALCON_DOMAIN_CTX, &HASH_ID_RAW, msg, &mut falcon_sig);
         // falcon_signer is ZeroizeOnDrop, automatically zeroized here
 
         Ok(Signature::from_parts(ed_sig, falcon_sig))

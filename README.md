@@ -70,7 +70,7 @@ what you expect.
 checking falcon. this is faster and leaks nothing—verification is a
 public operation on public inputs.
 
-`verify_strict()` always checks both signatures regardless of the first
+`verify_all()` always checks both signatures regardless of the first
 result.
 
 ```rust
@@ -78,7 +78,7 @@ result.
 pk.verify(msg, &sig)?;
 
 // both always checked
-pk.verify_strict(msg, &sig)?;
+pk.verify_all(msg, &sig)?;
 ```
 
 ## features
@@ -95,7 +95,9 @@ simd = []    # avx2 acceleration on x86_64
 
 ## no_std
 
-disable default features. requires `alloc`.
+disable default features. requires `alloc` — a `#[global_allocator]` must be
+available. the allocator is used for domain-tagged message construction and
+by fn-dsa internally.
 
 ```toml
 [dependencies]

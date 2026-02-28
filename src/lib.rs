@@ -2,8 +2,9 @@
 //!
 //! hybrid post-quantum signatures: ed25519 + falcon-512.
 //!
-//! both signatures are computed over the message. both must verify.
-//! if either is broken, you still have the other.
+//! both signatures are computed over a domain-tagged message. both must verify.
+//! if either is broken, you still have the other. domain separation prevents
+//! cross-protocol stripping attacks.
 //!
 //! ## usage
 //!
@@ -25,7 +26,7 @@
 //!
 //! ## signature crate interop
 //!
-//! implements [`signature::Signer`] and [`signature::Verifier`] for
+//! implements [`Signer`] and [`Verifier`] for
 //! compatibility with generic code:
 //!
 //! ```
@@ -50,6 +51,20 @@
 //! Signature    = ed25519_sig (64) || falcon_sig (666) = 730 bytes
 //! ```
 //!
+//! ## `no_std` support
+//!
+//! this crate is `no_std` by default but requires `alloc`. the allocator is
+//! used for domain-tagged message construction (ed25519 path) and by fn-dsa
+//! internally. a `#[global_allocator]` must be available.
+//!
+//! ## `AsRef<[u8]>`
+//!
+//! the core types ([`SigningKey`], [`VerifyingKey`], [`Signature`]) do not
+//! implement `AsRef<[u8]>` because their internal layout is not a single
+//! contiguous byte array. use [`to_bytes()`](VerifyingKey::to_bytes) for
+//! serialization. the substrate wrapper types (`substrate::Public`,
+//! `substrate::Signature`) store flat `[u8; N]` arrays and do implement it.
+//!
 //! ## falcon backend
 //!
 //! uses [fn-dsa](https://crates.io/crates/fn-dsa) by thomas pornin,
@@ -62,10 +77,16 @@
 //! break *both* schemes to forge a signature. this is a standard construction
 //! but has not been formally analyzed for this specific pairing.
 //!
+//! **domain separation**: both signature components use domain-tagged messages
+//! to prevent cross-protocol stripping attacks. ed25519 signs
+//! `"falconed-ed25519\x00" || msg`. falcon uses fn-dsa's native
+//! `DomainContext(b"falconed-falcon")`, which produces the unambiguous framing
+//! `0x00 || len(ctx) || ctx || msg` internally.
+//!
 //! **timing**: signing operations aim to be constant-time, but this depends
 //! on the underlying implementations (ed25519-dalek, fn-dsa). verification
 //! is explicitly *not* constant-time - it operates on public inputs only.
-//! [`VerifyingKey::verify_strict`] always runs both verifications but does
+//! [`VerifyingKey::verify_all`] always runs both verifications but does
 //! not guarantee constant-time execution.
 //!
 //! **zeroization**: secret key material is zeroized on drop. decoded falcon
@@ -92,7 +113,28 @@ extern crate alloc;
 mod error;
 mod signature;
 mod signing;
+#[cfg(feature = "substrate")]
+#[cfg_attr(docsrs, doc(cfg(feature = "substrate")))]
+pub mod substrate;
 mod verifying;
+
+/// domain tag prepended to messages before ed25519 signing/verification.
+/// prevents cross-protocol attacks where the ed25519 component could be
+/// stripped and replayed as a standalone ed25519 signature.
+pub(crate) const ED25519_DOMAIN_TAG: &[u8] = b"falconed-ed25519\x00";
+
+/// domain context passed to fn-dsa for falcon signing/verification.
+/// uses fn-dsa's built-in `0x00 || len(ctx) || ctx || msg` framing.
+pub(crate) const FALCON_DOMAIN_CTX: fn_dsa::DomainContext<'static> =
+    fn_dsa::DomainContext(b"falconed-falcon");
+
+/// build a domain-tagged message: `tag || msg`.
+pub(crate) fn tagged_message(tag: &[u8], msg: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut buf = alloc::vec::Vec::with_capacity(tag.len() + msg.len());
+    buf.extend_from_slice(tag);
+    buf.extend_from_slice(msg);
+    buf
+}
 
 pub use error::Error;
 pub use signature::Signature;
@@ -130,6 +172,12 @@ pub const VERIFYING_KEY_SIZE: usize = ED25519_PUBLIC_KEY_SIZE + FALCON_PUBLIC_KE
 
 /// combined secret key size.
 pub const SIGNING_KEY_SIZE: usize = ED25519_SEED_SIZE + FALCON_SECRET_KEY_SIZE;
+
+/// master seed size in bytes.
+///
+/// a 32-byte master seed is expanded via SHA-512 into independent ed25519
+/// and falcon keying material.
+pub const SEED_SIZE: usize = 32;
 
 #[cfg(test)]
 mod tests {
@@ -178,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_strict_succeeds() {
+    fn verify_all_succeeds() {
         let mut rng = rand::thread_rng();
         let sk = SigningKey::generate(&mut rng);
         let pk = sk.verifying_key().unwrap();
@@ -186,17 +234,28 @@ mod tests {
         let msg = b"test message";
         let sig = sk.sign(msg).unwrap();
 
-        assert!(pk.verify_strict(msg, &sig).is_ok());
+        assert!(pk.verify_all(msg, &sig).is_ok());
     }
 
     #[test]
-    fn verify_strict_fails_on_wrong_message() {
+    fn verify_all_fails_on_wrong_message() {
         let mut rng = rand::thread_rng();
         let sk = SigningKey::generate(&mut rng);
         let pk = sk.verifying_key().unwrap();
 
         let sig = sk.sign(b"correct").unwrap();
-        assert!(pk.verify_strict(b"wrong", &sig).is_err());
+        assert!(pk.verify_all(b"wrong", &sig).is_err());
+    }
+
+    #[test]
+    fn verifying_key_display_hex() {
+        use alloc::format;
+        let mut rng = rand::thread_rng();
+        let sk = SigningKey::generate(&mut rng);
+        let pk = sk.verifying_key().unwrap();
+        let hex = format!("{}", pk);
+        assert_eq!(hex.len(), VERIFYING_KEY_SIZE * 2);
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]
@@ -277,6 +336,46 @@ mod tests {
         let pk = sk.verifying_key().unwrap();
         assert!(pk.verify(b"msg", &sig1).is_ok());
         assert!(pk.verify(b"msg", &sig2).is_ok());
+    }
+
+    #[test]
+    fn from_seed_deterministic() {
+        let seed = [42u8; SEED_SIZE];
+        let sk1 = SigningKey::from_seed(&seed);
+        let sk2 = SigningKey::from_seed(&seed);
+        assert_eq!(sk1.to_bytes(), sk2.to_bytes());
+    }
+
+    #[test]
+    fn from_seed_different_seeds_differ() {
+        let sk1 = SigningKey::from_seed(&[1u8; SEED_SIZE]);
+        let sk2 = SigningKey::from_seed(&[2u8; SEED_SIZE]);
+        assert_ne!(sk1.to_bytes(), sk2.to_bytes());
+    }
+
+    #[test]
+    fn from_seed_sign_verify() {
+        let seed = [99u8; SEED_SIZE];
+        let sk = SigningKey::from_seed(&seed);
+        let pk = sk.verifying_key().unwrap();
+
+        let sig = sk.sign(b"seed test").unwrap();
+        assert!(pk.verify(b"seed test", &sig).is_ok());
+    }
+
+    #[test]
+    fn from_seed_slice_valid() {
+        let seed = [7u8; SEED_SIZE];
+        let sk1 = SigningKey::from_seed(&seed);
+        let sk2 = SigningKey::from_seed_slice(&seed).unwrap();
+        assert_eq!(sk1.to_bytes(), sk2.to_bytes());
+    }
+
+    #[test]
+    fn from_seed_slice_wrong_length() {
+        assert!(SigningKey::from_seed_slice(&[0u8; 31]).is_err());
+        assert!(SigningKey::from_seed_slice(&[0u8; 33]).is_err());
+        assert!(SigningKey::from_seed_slice(&[]).is_err());
     }
 
     #[test]
