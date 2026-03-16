@@ -17,6 +17,10 @@ pub enum Error {
     InvalidSignature,
     /// invalid key length.
     InvalidLength,
+    /// AEAD encryption failed.
+    EncryptionFailed,
+    /// AEAD decryption failed (wrong key, corrupted ciphertext, or tampered data).
+    DecryptionFailed,
 }
 
 impl fmt::Display for Error {
@@ -27,6 +31,8 @@ impl fmt::Display for Error {
             Error::InvalidFalconKey => write!(f, "invalid falcon key"),
             Error::InvalidSignature => write!(f, "invalid signature"),
             Error::InvalidLength => write!(f, "invalid length"),
+            Error::EncryptionFailed => write!(f, "encryption failed"),
+            Error::DecryptionFailed => write!(f, "decryption failed"),
         }
     }
 }

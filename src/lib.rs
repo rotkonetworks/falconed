@@ -1,28 +1,44 @@
 //! # falconed
 //!
-//! hybrid post-quantum signatures: ed25519 + falcon-512.
+//! hybrid post-quantum cryptography: ed25519 + falcon-512 signatures,
+//! x25519 + ml-kem-768 encryption.
 //!
-//! both signatures are computed over a domain-tagged message. both must verify.
-//! if either is broken, you still have the other. domain separation prevents
-//! cross-protocol stripping attacks.
+//! ## key hierarchy
+//!
+//! ```text
+//! SpendingKey (root authority — can sign, verify, and decrypt)
+//!   ├─ SigningKey          ed25519 + falcon-512
+//!   └─ FullViewingKey     (can verify + decrypt, NOT sign)
+//!        ├─ VerifyingKey  ed25519 + falcon-512
+//!        └─ ViewingKey    x25519 + ml-kem-768
+//!             └─ EncryptionPublicKey
+//! ```
 //!
 //! ## usage
 //!
 //! ```
-//! use falconed::{SigningKey, VerifyingKey, Signature};
+//! use falconed::{SpendingKey, encryption};
 //! use rand_core::OsRng;
 //!
-//! // generate a keypair
-//! let sk = SigningKey::generate(&mut OsRng);
-//! let pk = sk.verifying_key().unwrap();
+//! // one seed → one identity
+//! let sk = SpendingKey::generate(&mut OsRng);
 //!
-//! // sign a message
-//! let msg = b"the quick brown fox";
-//! let sig = sk.sign(msg).unwrap();
+//! // sign
+//! let sig = sk.sign(b"hello").unwrap();
 //!
-//! // verify
-//! assert!(pk.verify(msg, &sig).is_ok());
+//! // export viewing capability (safe for watch-only clients)
+//! let fvk = sk.full_viewing_key().unwrap();
+//! assert!(fvk.verify(b"hello", &sig).is_ok());
+//!
+//! // encrypt to this identity
+//! let epk = fvk.encryption_public_key();
+//! let encrypted = encryption::seal(&mut OsRng, &epk, b"secret").unwrap();
+//! let plaintext = encryption::open(fvk.viewing_key(), &encrypted).unwrap();
+//! assert_eq!(&plaintext, b"secret");
 //! ```
+//!
+//! the lower-level types ([`SigningKey`], [`VerifyingKey`]) are still
+//! available for direct use when you don't need the full hierarchy.
 //!
 //! ## signature crate interop
 //!
@@ -110,7 +126,9 @@ extern crate std;
 
 extern crate alloc;
 
+pub mod encryption;
 mod error;
+mod keys;
 mod signature;
 mod signing;
 #[cfg(feature = "substrate")]
@@ -137,9 +155,17 @@ pub(crate) fn tagged_message(tag: &[u8], msg: &[u8]) -> alloc::vec::Vec<u8> {
 }
 
 pub use error::Error;
+pub use keys::{FullViewingKey, SpendingKey, FULL_VIEWING_KEY_SIZE};
 pub use signature::Signature;
 pub use signing::SigningKey;
 pub use verifying::VerifyingKey;
+
+// re-export encryption types at crate root for convenience
+pub use encryption::{
+    seal, open, EncryptedMessage, EncryptionPublicKey, ViewingKey,
+    Capsule, CAPSULE_SIZE, ENCRYPTION_PUBLIC_KEY_SIZE, VIEWING_KEY_SIZE,
+    X25519_PUBLIC_KEY_SIZE, X25519_SECRET_KEY_SIZE,
+};
 
 // re-export signature traits for convenience
 pub use ::signature::{Signer, Verifier};

@@ -1,7 +1,17 @@
 //! substrate integration.
 //!
-//! provides wrapper types implementing [`sp_core::crypto::Pair`] for use in
-//! substrate runtimes and tooling. enable with `features = ["substrate"]`.
+//! provides wrapper types implementing [`sp_core::crypto::Pair`] and
+//! [`sp_runtime::traits::Verify`] for use in substrate runtimes.
+//! enable with `features = ["substrate"]`.
+//!
+//! ## account model
+//!
+//! the [`Public`] type is a full public identity containing both the
+//! verifying key (for signature verification) and the encryption public
+//! key (for encrypting messages to this account). on-chain, accounts are
+//! addressed by `AccountId32 = blake2_256(Public)` for compact storage
+//! and ecosystem compatibility. the full `Public` is stored once at
+//! account creation and looked up when cryptographic operations are needed.
 
 use alloc::vec::Vec;
 use codec::{Decode, Encode, Input, MaxEncodedLen, Output};
@@ -11,25 +21,52 @@ use sp_core::crypto::{
     Signature as TraitSignature,
 };
 
-use crate::{SEED_SIZE, SIGNATURE_SIZE, SIGNING_KEY_SIZE, VERIFYING_KEY_SIZE};
+use crate::{
+    ENCRYPTION_PUBLIC_KEY_SIZE, SEED_SIZE, SIGNATURE_SIZE, SIGNING_KEY_SIZE, VERIFYING_KEY_SIZE,
+};
 
 /// crypto type identifier: `*b"flcd"`.
 pub const CRYPTO_ID: CryptoTypeId = CryptoTypeId(*b"flcd");
 
+/// public identity size: verifying key + encryption public key.
+pub const PUBLIC_IDENTITY_SIZE: usize = VERIFYING_KEY_SIZE + ENCRYPTION_PUBLIC_KEY_SIZE;
+
 // ---------- Public ----------
 
-/// 929-byte verifying key wrapper for substrate.
+/// full public identity: verifying key + encryption public key.
 ///
-/// wraps the combined ed25519 + falcon-512 verifying key as a flat byte
-/// array, implementing `AsRef<[u8]>` (which the core [`crate::VerifyingKey`]
-/// cannot due to its non-contiguous internal layout).
+/// this is the account's complete public material. anyone holding it can
+/// verify signatures and encrypt messages to this account. on-chain,
+/// `AccountId32 = blake2_256(Public)` is used for compact addressing.
+///
+/// layout: `verifying_key (929) || encryption_public_key (1216) = 2145 bytes`
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub struct Public(pub [u8; VERIFYING_KEY_SIZE]);
+pub struct Public(pub [u8; PUBLIC_IDENTITY_SIZE]);
 
 impl Public {
     /// construct from a raw byte array.
-    pub fn from_raw(data: [u8; VERIFYING_KEY_SIZE]) -> Self {
+    pub fn from_raw(data: [u8; PUBLIC_IDENTITY_SIZE]) -> Self {
         Self(data)
+    }
+
+    /// extract the verifying key portion.
+    pub fn verifying_key_bytes(&self) -> &[u8; VERIFYING_KEY_SIZE] {
+        self.0[..VERIFYING_KEY_SIZE].try_into().unwrap()
+    }
+
+    /// extract the encryption public key portion.
+    pub fn encryption_public_key_bytes(&self) -> &[u8] {
+        &self.0[VERIFYING_KEY_SIZE..]
+    }
+
+    /// parse the verifying key from this identity.
+    pub fn verifying_key(&self) -> Result<crate::VerifyingKey, crate::Error> {
+        crate::VerifyingKey::from_bytes(self.verifying_key_bytes())
+    }
+
+    /// parse the encryption public key from this identity.
+    pub fn encryption_public_key(&self) -> Result<crate::EncryptionPublicKey, crate::Error> {
+        crate::EncryptionPublicKey::from_bytes(self.encryption_public_key_bytes())
     }
 }
 
@@ -59,10 +96,10 @@ impl TryFrom<&[u8]> for Public {
     type Error = ();
 
     fn try_from(data: &[u8]) -> Result<Self, ()> {
-        if data.len() != VERIFYING_KEY_SIZE {
+        if data.len() != PUBLIC_IDENTITY_SIZE {
             return Err(());
         }
-        let mut arr = [0u8; VERIFYING_KEY_SIZE];
+        let mut arr = [0u8; PUBLIC_IDENTITY_SIZE];
         arr.copy_from_slice(data);
         Ok(Self(arr))
     }
@@ -70,7 +107,7 @@ impl TryFrom<&[u8]> for Public {
 
 impl Encode for Public {
     fn size_hint(&self) -> usize {
-        VERIFYING_KEY_SIZE
+        PUBLIC_IDENTITY_SIZE
     }
 
     fn encode_to<T: Output + ?Sized>(&self, dest: &mut T) {
@@ -80,7 +117,7 @@ impl Encode for Public {
 
 impl Decode for Public {
     fn decode<I: Input>(input: &mut I) -> Result<Self, codec::Error> {
-        let mut arr = [0u8; VERIFYING_KEY_SIZE];
+        let mut arr = [0u8; PUBLIC_IDENTITY_SIZE];
         input.read(&mut arr)?;
         Ok(Self(arr))
     }
@@ -88,7 +125,7 @@ impl Decode for Public {
 
 impl MaxEncodedLen for Public {
     fn max_encoded_len() -> usize {
-        VERIFYING_KEY_SIZE
+        PUBLIC_IDENTITY_SIZE
     }
 }
 
@@ -100,13 +137,16 @@ impl scale_info::TypeInfo for Public {
             .path(scale_info::Path::new("Public", module_path!()))
             .composite(
                 scale_info::build::Fields::unnamed()
-                    .field(|f| f.ty::<[u8; VERIFYING_KEY_SIZE]>().type_name("[u8; 929]")),
+                    .field(|f| {
+                        f.ty::<[u8; PUBLIC_IDENTITY_SIZE]>()
+                            .type_name("[u8; 2145]")
+                    }),
             )
     }
 }
 
 impl ByteArray for Public {
-    const LEN: usize = VERIFYING_KEY_SIZE;
+    const LEN: usize = PUBLIC_IDENTITY_SIZE;
 }
 
 impl Derive for Public {}
@@ -116,6 +156,17 @@ impl CryptoType for Public {
 }
 
 impl TraitPublic for Public {}
+
+// ---------- IdentifyAccount: Public → AccountId32 ----------
+
+impl sp_runtime::traits::IdentifyAccount for Public {
+    type AccountId = sp_core::crypto::AccountId32;
+
+    fn into_account(self) -> sp_core::crypto::AccountId32 {
+        let hash = sp_crypto_hashing::blake2_256(self.as_ref());
+        sp_core::crypto::AccountId32::new(hash)
+    }
+}
 
 // ---------- Signature ----------
 
@@ -214,16 +265,45 @@ impl CryptoType for Signature {
 
 impl TraitSignature for Signature {}
 
+// ---------- Verify: Signature → AccountId32 ----------
+
+impl sp_runtime::traits::Verify for Signature {
+    type Signer = Public;
+
+    fn verify<L: sp_runtime::traits::Lazy<[u8]>>(
+        &self,
+        mut msg: L,
+        signer: &sp_core::crypto::AccountId32,
+    ) -> bool {
+        // we can't verify directly from AccountId32 (it's a hash).
+        // the runtime must resolve AccountId32 → Public via storage,
+        // then call Pair::verify. this impl exists so the type system
+        // is satisfied; actual verification goes through the Pair path.
+        //
+        // however, for MultiSignature compatibility, we attempt to verify
+        // against all known crypto schemes — but falconed signatures are
+        // only valid when the full Public is available, so we return false
+        // here. the runtime should use a custom SignedExtension or
+        // CheckedExtrinsic that resolves the full public key.
+        let _ = msg.get();
+        let _ = signer;
+        false
+    }
+}
+
 // ---------- Pair ----------
 
 /// falconed keypair for substrate.
 ///
 /// caches serialized key bytes to avoid repeated derivation. the seed
 /// enables hierarchical key derivation (hard junctions only).
+///
+/// the public key includes both the verifying key and the encryption
+/// public key, forming a complete public identity.
 pub struct Pair {
     seed: [u8; SEED_SIZE],
     signing_key_bytes: [u8; SIGNING_KEY_SIZE],
-    public_bytes: [u8; VERIFYING_KEY_SIZE],
+    public_bytes: [u8; PUBLIC_IDENTITY_SIZE],
 }
 
 impl Clone for Pair {
@@ -240,6 +320,32 @@ impl CryptoType for Pair {
     type Pair = Pair;
 }
 
+impl Pair {
+    /// get the `AccountId32` for this keypair.
+    pub fn account_id(&self) -> sp_core::crypto::AccountId32 {
+        use sp_runtime::traits::IdentifyAccount;
+        self.public().into_account()
+    }
+
+    /// verify a signature against the full public identity (not the hashed account id).
+    ///
+    /// this is the correct verification path for runtimes: resolve
+    /// `AccountId32` → `Public` from storage, then call this.
+    pub fn verify_with_public<M: AsRef<[u8]>>(
+        sig: &Signature,
+        message: M,
+        pubkey: &Public,
+    ) -> bool {
+        let Ok(vk) = crate::VerifyingKey::from_bytes(pubkey.verifying_key_bytes()) else {
+            return false;
+        };
+        let Ok(s) = crate::Signature::from_bytes(&sig.0) else {
+            return false;
+        };
+        vk.verify(message.as_ref(), &s).is_ok()
+    }
+}
+
 impl TraitPair for Pair {
     type Public = Public;
     type Seed = [u8; SEED_SIZE];
@@ -252,15 +358,20 @@ impl TraitPair for Pair {
         let mut seed = [0u8; SEED_SIZE];
         seed.copy_from_slice(seed_slice);
 
-        let signing_key = crate::SigningKey::from_seed(&seed);
-        let verifying_key = signing_key
+        let spending_key = crate::SpendingKey::from_seed(&seed);
+        let verifying_key = spending_key
             .verifying_key()
             .map_err(|_| SecretStringError::InvalidSeed)?;
+        let encryption_public_key = spending_key.encryption_public_key();
+
+        let mut public_bytes = [0u8; PUBLIC_IDENTITY_SIZE];
+        public_bytes[..VERIFYING_KEY_SIZE].copy_from_slice(&verifying_key.to_bytes());
+        public_bytes[VERIFYING_KEY_SIZE..].copy_from_slice(&encryption_public_key.to_bytes());
 
         Ok(Pair {
             seed,
-            signing_key_bytes: signing_key.to_bytes(),
-            public_bytes: verifying_key.to_bytes(),
+            signing_key_bytes: spending_key.signing_key().to_bytes(),
+            public_bytes,
         })
     }
 
@@ -292,13 +403,7 @@ impl TraitPair for Pair {
     }
 
     fn verify<M: AsRef<[u8]>>(sig: &Signature, message: M, pubkey: &Public) -> bool {
-        let Ok(vk) = crate::VerifyingKey::from_bytes(&pubkey.0) else {
-            return false;
-        };
-        let Ok(s) = crate::Signature::from_bytes(&sig.0) else {
-            return false;
-        };
-        vk.verify(message.as_ref(), &s).is_ok()
+        Pair::verify_with_public(sig, message, pubkey)
     }
 
     fn to_raw_vec(&self) -> Vec<u8> {
@@ -357,5 +462,54 @@ mod tests {
         let (pair2, seed2) = Pair::from_phrase(&phrase, None).unwrap();
         assert_eq!(pair1.public(), pair2.public());
         assert_eq!(seed, seed2);
+    }
+
+    #[test]
+    fn public_identity_size() {
+        let (pair, _) = Pair::generate();
+        let public = pair.public();
+        assert_eq!(public.as_ref().len(), PUBLIC_IDENTITY_SIZE);
+        assert_eq!(PUBLIC_IDENTITY_SIZE, VERIFYING_KEY_SIZE + ENCRYPTION_PUBLIC_KEY_SIZE);
+    }
+
+    #[test]
+    fn public_identity_contains_both_keys() {
+        let (pair, _) = Pair::generate();
+        let public = pair.public();
+        // both portions should parse successfully
+        assert!(public.verifying_key().is_ok());
+        assert!(public.encryption_public_key().is_ok());
+    }
+
+    #[test]
+    fn account_id_is_blake2_hash() {
+        let (pair, _) = Pair::generate();
+        let public = pair.public();
+        let account_id = pair.account_id();
+        let expected = sp_crypto_hashing::blake2_256(public.as_ref());
+        assert_eq!(AsRef::<[u8; 32]>::as_ref(&account_id), &expected);
+    }
+
+    #[test]
+    fn different_seeds_different_account_ids() {
+        let p1 = Pair::from_seed_slice(&[1u8; SEED_SIZE]).unwrap();
+        let p2 = Pair::from_seed_slice(&[2u8; SEED_SIZE]).unwrap();
+        assert_ne!(p1.account_id(), p2.account_id());
+    }
+
+    #[test]
+    fn can_encrypt_to_public_identity() {
+        let (pair, _) = Pair::generate();
+        let public = pair.public();
+        let epk = public.encryption_public_key().unwrap();
+
+        // derive viewing key from same seed to decrypt
+        let spending = crate::SpendingKey::from_seed_slice(pair.to_raw_vec().as_slice()).unwrap();
+        let viewing = spending.viewing_key();
+
+        let mut rng = rand_core::OsRng;
+        let encrypted = crate::encryption::seal(&mut rng, &epk, b"hello chain").unwrap();
+        let decrypted = crate::encryption::open(viewing, &encrypted).unwrap();
+        assert_eq!(&decrypted, b"hello chain");
     }
 }
