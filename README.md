@@ -66,19 +66,19 @@ what you expect.
 
 ## verification semantics
 
-`verify()` checks ed25519 first. if it fails, returns early without
-checking falcon. this is faster and leaks nothing—verification is a
-public operation on public inputs.
+`verify()` always checks both ed25519 and falcon components regardless
+of whether either fails. this prevents leaking which component failed
+through timing differences.
 
-`verify_all()` always checks both signatures regardless of the first
-result.
+`verify_fast()` short-circuits on first failure for performance-sensitive
+paths where timing is irrelevant (public inputs only).
 
 ```rust
-// fast path (default)
+// default: always checks both (prefer this)
 pk.verify(msg, &sig)?;
 
-// both always checked
-pk.verify_all(msg, &sig)?;
+// fast path: short-circuits on ed25519 failure
+pk.verify_fast(msg, &sig)?;
 ```
 
 ## features
@@ -104,19 +104,54 @@ by fn-dsa internally.
 falconed = { version = "0.1", default-features = false }
 ```
 
+## key management
+
+`SpendingKey` retains the master seed for backup/export. if you don't
+need it after derivation, use `into_keys()` to zeroize the seed
+immediately:
+
+```rust
+use falconed::SpendingKey;
+use rand_core::OsRng;
+
+let sk = SpendingKey::generate(&mut OsRng);
+let (signing, viewing) = sk.into_keys();
+// seed is zeroized — only the derived keys remain in memory
+```
+
 ## security considerations
 
-**hybrid construction**: this crate concatenates independent ed25519 and
+**hybrid signatures**: this crate concatenates independent ed25519 and
 falcon-512 signatures. an attacker must break *both* schemes to forge a
-signature. this is a standard construction but has not been formally
-analyzed for this specific pairing.
+signature. the two signature components are not cryptographically bound
+to each other — security relies on domain-tagged messages and both
+components being verified. this is a standard concatenation combiner
+but has not been formally analyzed for this specific pairing.
+
+**hybrid encryption**: the KEM combiner follows the X-Wing design
+philosophy (Barbosa, Connolly et al.) with ml-kem shared secret first
+in the KDF input for FIPS SP 800-56Cr2 alignment. both KEM components
+run unconditionally during decapsulation to prevent timing side-channels.
+includes full transcript binding (all public keys and ciphertexts).
 
 **timing**: signing operations aim to be constant-time, but this depends
-on the underlying implementations (ed25519-dalek, fn-dsa). verification
-is explicitly *not* constant-time—it operates on public inputs only.
+on the underlying implementations (ed25519-dalek, fn-dsa). `verify()`
+always checks both components to avoid leaking which failed.
+`verify_fast()` short-circuits and should only be used on public-input
+paths. key commitment comparison uses constant-time equality.
+decapsulation runs both x25519 and ml-kem before checking for errors.
 
-**zeroization**: secret key material is zeroized on drop. decoded falcon
-signing keys are zeroized after each operation.
+**zeroization**: secret key material is zeroized on drop via volatile
+writes + compiler fences. decoded falcon signing keys are zeroized after
+each operation. `SpendingKey::into_keys()` zeroizes the seed immediately.
+enable the `zeroize` feature for additional guarantees via the `zeroize`
+crate.
+
+**deterministic derivation**: key derivation from seeds depends on the
+internal behaviour of `fn-dsa`, `ml-kem`, and `rand_chacha`. upgrading
+these dependencies may change derived keys for the same seed. pinned
+test vectors for both signing and viewing key derivation will catch
+this in CI. pin dependency versions before deploying.
 
 **not audited**: this implementation has not been professionally audited.
 use at your own risk for anything important.

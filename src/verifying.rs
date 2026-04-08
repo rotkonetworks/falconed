@@ -44,44 +44,13 @@ impl VerifyingKey {
 
     /// verify a signature over a message.
     ///
-    /// checks ed25519 first. if it fails, returns early without checking falcon.
-    /// this is faster and leaks nothing—verification is a public operation on
-    /// public inputs.
+    /// always checks both ed25519 and falcon components regardless of
+    /// whether either fails. this prevents leaking which component failed
+    /// through timing differences.
     ///
-    /// use [`verify_all`](Self::verify_all) if you need both signatures
-    /// to always be checked regardless of the first result.
+    /// use [`verify_fast`](Self::verify_fast) if you need early-exit
+    /// behaviour on public-input-only paths where timing is irrelevant.
     pub fn verify(&self, msg: &[u8], sig: &Signature) -> Result<(), Error> {
-        use ed25519_dalek::Verifier;
-
-        // ed25519 first - fast path
-        let ed_msg = crate::tagged_message(crate::ED25519_DOMAIN_TAG, msg);
-        self.ed25519
-            .verify(&ed_msg, sig.ed25519())
-            .map_err(|_| Error::VerificationFailed)?;
-
-        // then falcon
-        let falcon_vk: VerifyingKey512 = FnDsaVerifyingKey::decode(&self.falcon_pk)
-            .ok_or(Error::InvalidFalconKey)?;
-
-        if !falcon_vk.verify(sig.falcon(), &crate::FALCON_DOMAIN_CTX, &HASH_ID_RAW, msg) {
-            return Err(Error::VerificationFailed);
-        }
-
-        Ok(())
-    }
-
-    /// verify a signature, always checking both components.
-    ///
-    /// both ed25519 and falcon signatures are verified regardless of
-    /// whether either fails.
-    ///
-    /// # timing
-    ///
-    /// this method always executes both verification algorithms, but the
-    /// underlying implementations (ed25519-dalek, fn-dsa) may not be
-    /// constant-time for invalid signatures. do not rely on this for
-    /// timing-sensitive applications without auditing the dependencies.
-    pub fn verify_all(&self, msg: &[u8], sig: &Signature) -> Result<(), Error> {
         use ed25519_dalek::Verifier;
 
         let ed_msg = crate::tagged_message(crate::ED25519_DOMAIN_TAG, msg);
@@ -96,6 +65,39 @@ impl VerifyingKey {
         } else {
             Err(Error::VerificationFailed)
         }
+    }
+
+    /// verify a signature, short-circuiting on first failure.
+    ///
+    /// checks ed25519 first. if it fails, returns early without checking
+    /// falcon. this is faster but creates a timing difference between
+    /// "ed25519 failed" and "falcon failed". since verification operates
+    /// on public inputs only, this is safe in most contexts.
+    ///
+    /// prefer [`verify`](Self::verify) unless you have measured that
+    /// verification is a bottleneck.
+    pub fn verify_fast(&self, msg: &[u8], sig: &Signature) -> Result<(), Error> {
+        use ed25519_dalek::Verifier;
+
+        let ed_msg = crate::tagged_message(crate::ED25519_DOMAIN_TAG, msg);
+        self.ed25519
+            .verify(&ed_msg, sig.ed25519())
+            .map_err(|_| Error::VerificationFailed)?;
+
+        let falcon_vk: VerifyingKey512 = FnDsaVerifyingKey::decode(&self.falcon_pk)
+            .ok_or(Error::InvalidFalconKey)?;
+
+        if !falcon_vk.verify(sig.falcon(), &crate::FALCON_DOMAIN_CTX, &HASH_ID_RAW, msg) {
+            return Err(Error::VerificationFailed);
+        }
+
+        Ok(())
+    }
+
+    /// verify a signature, always checking both components.
+    #[deprecated(since = "0.2.0", note = "use verify() which now always checks both components")]
+    pub fn verify_all(&self, msg: &[u8], sig: &Signature) -> Result<(), Error> {
+        self.verify(msg, sig)
     }
 
     /// serialize the verifying key to bytes.

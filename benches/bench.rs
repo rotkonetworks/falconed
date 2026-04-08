@@ -39,15 +39,15 @@ fn bench_verify(c: &mut Criterion) {
     });
 }
 
-fn bench_verify_all(c: &mut Criterion) {
+fn bench_verify_fast(c: &mut Criterion) {
     let sk = SigningKey::generate(&mut OsRng);
     let pk = sk.verifying_key().unwrap();
     let msg = b"the quick brown fox jumps over the lazy dog";
     let sig = sk.sign(msg).unwrap();
 
-    c.bench_function("VerifyingKey::verify_all", |b| {
+    c.bench_function("VerifyingKey::verify_fast", |b| {
         b.iter(|| {
-            let result = pk.verify_all(black_box(msg), black_box(&sig));
+            let result = pk.verify_fast(black_box(msg), black_box(&sig));
             black_box(result)
         })
     });
@@ -69,7 +69,7 @@ criterion_group!(
     bench_keygen,
     bench_sign,
     bench_verify,
-    bench_verify_all,
+    bench_verify_fast,
     bench_verifying_key_derivation,
 );
 
