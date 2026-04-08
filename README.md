@@ -1,21 +1,55 @@
 # falconed
 
-hybrid post-quantum signatures for people who ship things.
+a hybrid signature scheme combining ed25519 and falcon-512, and a hybrid
+KEM combining x25519 and ML-KEM-768.
 
-## what
+the design goal is simple: if either the classical or post-quantum
+component is broken, the hybrid construction remains at least as strong
+as the surviving component. this is the standard "concatenation combiner"
+approach — the hybrid is no weaker than its strongest constituent.
 
-this crate combines ed25519 with falcon-512. both signatures are computed
-over the message. both must verify. if either is broken, you still have
-the other.
+## design
 
-this is the conservative choice for systems that need to last.
+### signatures
 
-## why
+a `SigningKey` holds an ed25519 signing key and a falcon-512 signing key,
+both derived deterministically from a 32-byte seed via domain-separated
+SHA-512:
 
-- 48% of nist pqc round-1 submissions are broken
-- falcon might join them someday
-- ed25519 will fall to cryptographically relevant quantum computers
-- hedge your bets
+```text
+ed25519_seed  = SHA-512(len("falconed-ed25519")  || "falconed-ed25519"  || seed)[..32]
+falcon_seed   = SHA-512(len("falconed-falcon")   || "falconed-falcon"   || seed)[..32]
+```
+
+signing produces the concatenation `ed25519_sig || falcon_sig`. both
+components sign the same message. verification checks both components
+unconditionally — `verify()` does not short-circuit on the first failure,
+preventing timing side-channels that would reveal which component failed.
+a `verify_fast()` method is provided for contexts where all inputs are
+public and timing is irrelevant.
+
+### encryption
+
+the hybrid KEM combines x25519 ECDH with ML-KEM-768. the KEM combiner
+follows the [X-Wing][xwing] design philosophy, placing the ML-KEM shared
+secret first in the KDF input for alignment with FIPS SP 800-56Cr2.
+the combiner binds the full transcript: both public keys and both
+ciphertexts are included in the KDF input. decapsulation runs both
+KEMs unconditionally before checking for errors.
+
+authenticated encryption uses ChaCha20-Poly1305 with a key commitment
+scheme to prevent invisible salamanders (key-commitment attacks on AEAD).
+
+### key hierarchy
+
+`SpendingKey` is the master secret (a 32-byte seed). it derives:
+- a `SigningKey` (ed25519 + falcon-512) for signatures
+- a `ViewingKey` (x25519 + ML-KEM-768) for encryption
+
+all derivation is deterministic and domain-separated. if you don't need
+the master seed after derivation, `into_keys()` zeroizes it immediately.
+
+[xwing]: https://eprint.iacr.org/2024/039
 
 ## usage
 
@@ -23,142 +57,88 @@ this is the conservative choice for systems that need to last.
 use falconed::{SigningKey, VerifyingKey, Signature};
 use rand_core::OsRng;
 
-// generate a keypair
 let sk = SigningKey::generate(&mut OsRng);
-let pk = sk.verifying_key().unwrap();
+let vk = sk.verifying_key().unwrap();
 
-// sign a message
 let msg = b"the quick brown fox";
 let sig = sk.sign(msg).unwrap();
 
-// verify
-assert!(pk.verify(msg, &sig).is_ok());
+assert!(vk.verify(msg, &sig).is_ok());
 ```
 
-## signature crate interop
+implements `signature::Signer` and `signature::Verifier` for
+interoperability with the `signature` crate ecosystem.
 
-implements `signature::Signer` and `signature::Verifier`:
+## wire format
 
-```rust
-use signature::{Signer, Verifier};
-use falconed::SigningKey;
-use rand_core::OsRng;
-
-let sk = SigningKey::generate(&mut OsRng);
-let pk = sk.verifying_key().unwrap();
-
-let sig = sk.try_sign(b"message").unwrap();
-assert!(pk.verify(b"message", &sig).is_ok());
-```
-
-## serialization
-
-all types are fixed-size. concatenation, no length prefixes, no asn.1.
+fixed-size concatenation. no length prefixes, no ASN.1, no negotiation.
 
 ```text
-SigningKey   = ed25519_seed (32) || falcon_sk (1281) = 1313 bytes
-VerifyingKey = ed25519_pk (32) || falcon_pk (897) = 929 bytes
-Signature    = ed25519_sig (64) || falcon_sig (666) = 730 bytes
+SigningKey    = ed25519_seed (32) || falcon_sk (1281)  = 1313 bytes
+VerifyingKey  = ed25519_vk  (32) || falcon_vk (897)   = 929 bytes
+Signature     = ed25519_sig (64) || falcon_sig (666)   = 730 bytes
 ```
 
-`to_bytes()` and `from_bytes()` on everything. `TryFrom<&[u8]>` does
-what you expect.
-
-## verification semantics
-
-`verify()` always checks both ed25519 and falcon components regardless
-of whether either fails. this prevents leaking which component failed
-through timing differences.
-
-`verify_fast()` short-circuits on first failure for performance-sensitive
-paths where timing is irrelevant (public inputs only).
-
-```rust
-// default: always checks both (prefer this)
-pk.verify(msg, &sig)?;
-
-// fast path: short-circuits on ed25519 failure
-pk.verify_fast(msg, &sig)?;
-```
+`to_bytes()` / `from_bytes()` on all types. `TryFrom<&[u8]>` works as
+expected.
 
 ## features
 
-```toml
-[features]
-default = ["std"]
-std = []
-serde = ["dep:serde"]
-zeroize = ["dep:zeroize"]
-hazmat = []  # expose internal key components
-simd = []    # avx2 acceleration on x86_64
-```
+| feature | default | description |
+|---------|---------|-------------|
+| `std` | yes | std support via ed25519-dalek |
+| `zeroize` | yes | zeroize secrets on drop via the `zeroize` crate |
+| `serde` | no | serde `Serialize`/`Deserialize` |
+| `hazmat` | no | expose internal key components |
+| `simd` | no | AVX2 acceleration for falcon on x86_64 |
+| `substrate` | no | substrate `sp_core::Pair` integration |
 
-## no_std
+### `no_std`
 
-disable default features. requires `alloc` — a `#[global_allocator]` must be
-available. the allocator is used for domain-tagged message construction and
-by fn-dsa internally.
+disable default features. requires `alloc` — falcon's internals and
+domain-tagged message construction need a global allocator.
 
 ```toml
-[dependencies]
 falconed = { version = "0.1", default-features = false }
 ```
 
-## key management
+## security
 
-`SpendingKey` retains the master seed for backup/export. if you don't
-need it after derivation, use `into_keys()` to zeroize the seed
-immediately:
+**combiner model.** the signature combiner is concatenation: sign with
+both, verify both. an attacker must break *both* ed25519 and falcon-512
+to forge. the two components are not cryptographically bound to each
+other beyond sharing the same message; security relies on both
+components being checked. this is a standard construction but has not
+been formally analyzed for this specific instantiation.
 
-```rust
-use falconed::SpendingKey;
-use rand_core::OsRng;
+**timing.** `verify()` evaluates both components unconditionally to avoid
+leaking which failed. `verify_fast()` short-circuits and must only be
+used when timing is irrelevant (all inputs public). decapsulation runs
+both KEMs before returning. key commitment uses `subtle::ConstantTimeEq`.
+constant-time properties of the underlying primitives depend on
+`ed25519-dalek` and `fn-dsa`.
 
-let sk = SpendingKey::generate(&mut OsRng);
-let (signing, viewing) = sk.into_keys();
-// seed is zeroized — only the derived keys remain in memory
-```
+**zeroization.** secret material is zeroized on drop via volatile writes
+and compiler fences. the `zeroize` feature (on by default) additionally
+uses the `zeroize` crate. decoded falcon signing keys are zeroized after
+each signing operation. `SpendingKey::into_keys()` zeroizes the seed
+immediately. note that we cannot guarantee that the optimizer, OS, or
+hardware will not copy secrets elsewhere in memory — this is a
+best-effort defense.
 
-## security considerations
+**deterministic derivation.** key derivation from seeds is deterministic
+but depends on the internal RNG consumption patterns of `fn-dsa`,
+`ml-kem`, and `rand_chacha`. upgrading these dependencies may silently
+change derived keys for the same seed. all three are pinned to exact
+versions. test vectors catch derivation drift in CI. **do not unpin
+these dependencies without re-verifying all test vectors.**
 
-**hybrid signatures**: this crate concatenates independent ed25519 and
-falcon-512 signatures. an attacker must break *both* schemes to forge a
-signature. the two signature components are not cryptographically bound
-to each other — security relies on domain-tagged messages and both
-components being verified. this is a standard concatenation combiner
-but has not been formally analyzed for this specific pairing.
-
-**hybrid encryption**: the KEM combiner follows the X-Wing design
-philosophy (Barbosa, Connolly et al.) with ml-kem shared secret first
-in the KDF input for FIPS SP 800-56Cr2 alignment. both KEM components
-run unconditionally during decapsulation to prevent timing side-channels.
-includes full transcript binding (all public keys and ciphertexts).
-
-**timing**: signing operations aim to be constant-time, but this depends
-on the underlying implementations (ed25519-dalek, fn-dsa). `verify()`
-always checks both components to avoid leaking which failed.
-`verify_fast()` short-circuits and should only be used on public-input
-paths. key commitment comparison uses constant-time equality.
-decapsulation runs both x25519 and ml-kem before checking for errors.
-
-**zeroization**: secret key material is zeroized on drop via volatile
-writes + compiler fences. decoded falcon signing keys are zeroized after
-each operation. `SpendingKey::into_keys()` zeroizes the seed immediately.
-enable the `zeroize` feature for additional guarantees via the `zeroize`
-crate.
-
-**deterministic derivation**: key derivation from seeds depends on the
-internal behaviour of `fn-dsa`, `ml-kem`, and `rand_chacha`. upgrading
-these dependencies may change derived keys for the same seed. pinned
-test vectors for both signing and viewing key derivation will catch
-this in CI. pin dependency versions before deploying.
-
-**not audited**: this implementation has not been professionally audited.
-use at your own risk for anything important.
+**not audited.** this crate has not received a professional security
+audit. use it at your own risk.
 
 ## benchmarks
 
-measured on amd ryzen 9 7950x:
+AMD Ryzen 9 7950X, single-threaded:
 
 | operation | time |
 |-----------|------|
@@ -166,26 +146,13 @@ measured on amd ryzen 9 7950x:
 | sign | ~162 µs |
 | verify | ~34 µs |
 
-## falcon backend
+## implementation
 
-uses [fn-dsa](https://crates.io/crates/fn-dsa) by thomas pornin,
-the original author of falcon. pure rust, no C bindings.
+the falcon backend is [fn-dsa](https://crates.io/crates/fn-dsa) by
+thomas pornin (the original falcon author). pure rust, no C bindings.
 
-## msrv
-
-1.82 (required by fn-dsa)
+MSRV: **1.82** (required by fn-dsa).
 
 ## license
 
-mit or apache-2.0, your choice.
-
-## status
-
-this is alpha software. the api may change. don't use it for anything
-important until it's been audited.
-
-## acknowledgments
-
-built on:
-- [ed25519-dalek](https://github.com/dalek-cryptography/ed25519-dalek)
-- [fn-dsa](https://github.com/pornin/rust-fn-dsa) by thomas pornin
+MIT or Apache-2.0.
