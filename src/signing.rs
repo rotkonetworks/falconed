@@ -10,7 +10,6 @@ use fn_dsa::{
     KeyPairGenerator, KeyPairGenerator512, SigningKey as FnDsaSigningKey,
     SigningKey512, FN_DSA_LOGN_512, HASH_ID_RAW,
 };
-use sha2::{Sha512, Digest};
 
 // note: SigningKey512 derives ZeroizeOnDrop, so decoded keys are
 // automatically zeroized when they go out of scope.
@@ -62,22 +61,16 @@ impl SigningKey {
     pub fn from_seed(seed: &[u8; SEED_SIZE]) -> Self {
         use rand_chacha::rand_core::SeedableRng;
 
-        // derive ed25519 seed
-        let ed_hash = Sha512::new()
-            .chain_update(b"falconed-ed25519")
-            .chain_update(seed)
-            .finalize();
+        // derive ed25519 seed via length-prefixed domain KDF
+        let mut ed_kdf = crate::domain_kdf(b"falconed-ed25519", seed);
         let mut ed_seed = [0u8; 32];
-        ed_seed.copy_from_slice(&ed_hash[..32]);
+        ed_seed.copy_from_slice(&ed_kdf[..32]);
         let ed25519 = Ed25519SigningKey::from_bytes(&ed_seed);
 
-        // derive falcon rng seed
-        let falcon_hash = Sha512::new()
-            .chain_update(b"falconed-falcon")
-            .chain_update(seed)
-            .finalize();
+        // derive falcon rng seed via length-prefixed domain KDF
+        let mut falcon_kdf = crate::domain_kdf(b"falconed-falcon", seed);
         let mut falcon_rng_seed = [0u8; 32];
-        falcon_rng_seed.copy_from_slice(&falcon_hash[..32]);
+        falcon_rng_seed.copy_from_slice(&falcon_kdf[..32]);
         let mut falcon_rng = rand_chacha::ChaCha20Rng::from_seed(falcon_rng_seed);
 
         let mut falcon_sk = [0u8; FALCON_SECRET_KEY_SIZE];
@@ -86,10 +79,10 @@ impl SigningKey {
         kg.keygen(FN_DSA_LOGN_512, &mut falcon_rng, &mut falcon_sk, &mut falcon_pk);
 
         // zeroize intermediates
-        for byte in ed_seed.iter_mut().chain(falcon_rng_seed.iter_mut()) {
-            unsafe { core::ptr::write_volatile(byte, 0) };
-        }
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        crate::zeroize_bytes(&mut ed_kdf);
+        crate::zeroize_bytes(&mut ed_seed);
+        crate::zeroize_bytes(&mut falcon_kdf);
+        crate::zeroize_bytes(&mut falcon_rng_seed);
 
         Self { ed25519, falcon_sk }
     }
@@ -116,7 +109,13 @@ impl SigningKey {
         self.sign_with_rng(&mut rand_core::OsRng, msg)
     }
 
-    /// sign a message with explicit rng.
+    /// sign a message with explicit rng for the falcon component.
+    ///
+    /// **note**: the `rng` is only used by falcon-512 for signature
+    /// randomization. ed25519 uses deterministic signing (RFC 8032) and
+    /// ignores this parameter. if you need hedged ed25519 signing for
+    /// fault-attack resistance, use the `hazmat` feature to access the
+    /// ed25519 key directly.
     ///
     /// # errors
     ///
@@ -127,6 +126,7 @@ impl SigningKey {
     {
         use ed25519_dalek::Signer;
 
+        // ed25519: deterministic signing per RFC 8032 — rng is NOT used here.
         let ed_msg = crate::tagged_message(crate::ED25519_DOMAIN_TAG, msg);
         let ed_sig = self.ed25519.sign(&ed_msg);
 
@@ -226,14 +226,16 @@ impl TryFrom<&[u8]> for SigningKey {
 
 impl Drop for SigningKey {
     fn drop(&mut self) {
-        // always zeroize secret key material on drop
-        // use volatile write to prevent compiler from optimizing this away
-        for byte in self.falcon_sk.iter_mut() {
-            unsafe {
-                core::ptr::write_volatile(byte, 0);
-            }
+        // zeroize falcon secret key material on drop.
+        // ed25519-dalek handles its own zeroization internally.
+        #[cfg(feature = "zeroize")]
+        {
+            zeroize::Zeroize::zeroize(&mut self.falcon_sk);
         }
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(feature = "zeroize"))]
+        {
+            crate::zeroize_bytes(&mut self.falcon_sk);
+        }
     }
 }
 

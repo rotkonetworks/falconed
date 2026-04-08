@@ -100,10 +100,10 @@
 //! `0x00 || len(ctx) || ctx || msg` internally.
 //!
 //! **timing**: signing operations aim to be constant-time, but this depends
-//! on the underlying implementations (ed25519-dalek, fn-dsa). verification
-//! is explicitly *not* constant-time - it operates on public inputs only.
-//! [`VerifyingKey::verify_all`] always runs both verifications but does
-//! not guarantee constant-time execution.
+//! on the underlying implementations (ed25519-dalek, fn-dsa).
+//! [`VerifyingKey::verify`] always runs both verifications to avoid
+//! leaking which component failed. [`VerifyingKey::verify_fast`] short-
+//! circuits on first failure for performance-sensitive public-input paths.
 //!
 //! **zeroization**: secret key material is zeroized on drop. decoded falcon
 //! signing keys are zeroized after each operation. ed25519-dalek handles its
@@ -139,7 +139,7 @@ mod verifying;
 /// domain tag prepended to messages before ed25519 signing/verification.
 /// prevents cross-protocol attacks where the ed25519 component could be
 /// stripped and replayed as a standalone ed25519 signature.
-pub(crate) const ED25519_DOMAIN_TAG: &[u8] = b"falconed-ed25519\x00";
+pub(crate) const ED25519_DOMAIN_TAG: &[u8; 17] = b"falconed-ed25519\x00";
 
 /// domain context passed to fn-dsa for falcon signing/verification.
 /// uses fn-dsa's built-in `0x00 || len(ctx) || ctx || msg` framing.
@@ -147,11 +147,44 @@ pub(crate) const FALCON_DOMAIN_CTX: fn_dsa::DomainContext<'static> =
     fn_dsa::DomainContext(b"falconed-falcon");
 
 /// build a domain-tagged message: `tag || msg`.
-pub(crate) fn tagged_message(tag: &[u8], msg: &[u8]) -> alloc::vec::Vec<u8> {
-    let mut buf = alloc::vec::Vec::with_capacity(tag.len() + msg.len());
+///
+/// the tag is a fixed-size array to prevent accidental use with
+/// variable-length tags, which would allow trivial collisions
+/// (e.g. `"ab" || "cd"` == `"abc" || "d"`).
+pub(crate) fn tagged_message<const N: usize>(tag: &[u8; N], msg: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut buf = alloc::vec::Vec::with_capacity(N + msg.len());
     buf.extend_from_slice(tag);
     buf.extend_from_slice(msg);
     buf
+}
+
+/// domain-separated KDF: `SHA-512(len(tag) || tag || input)`.
+///
+/// the length prefix prevents ambiguity between tags that are prefixes
+/// of each other. tags must be <= 255 bytes (enforced by taking `&[u8; N]`
+/// through the call sites, but asserted here defensively).
+pub(crate) fn domain_kdf(tag: &[u8], input: &[u8]) -> [u8; 64] {
+    use sha2::{Digest, Sha512};
+    debug_assert!(tag.len() <= 255, "domain tag exceeds u8 length prefix");
+    let hash = Sha512::new()
+        .chain_update(&[tag.len() as u8])
+        .chain_update(tag)
+        .chain_update(input)
+        .finalize();
+    let mut out = [0u8; 64];
+    out.copy_from_slice(&hash);
+    out
+}
+
+/// zeroize a byte slice via volatile writes + compiler fence.
+///
+/// best-effort fallback for when the `zeroize` crate feature is not enabled.
+/// prefer `zeroize::Zeroize` when available.
+pub(crate) fn zeroize_bytes(bytes: &mut [u8]) {
+    for byte in bytes.iter_mut() {
+        unsafe { core::ptr::write_volatile(byte, 0) };
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 pub use error::Error;
@@ -252,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_all_succeeds() {
+    fn verify_checks_both_components() {
         let mut rng = rand::thread_rng();
         let sk = SigningKey::generate(&mut rng);
         let pk = sk.verifying_key().unwrap();
@@ -260,17 +293,29 @@ mod tests {
         let msg = b"test message";
         let sig = sk.sign(msg).unwrap();
 
-        assert!(pk.verify_all(msg, &sig).is_ok());
+        assert!(pk.verify(msg, &sig).is_ok());
     }
 
     #[test]
-    fn verify_all_fails_on_wrong_message() {
+    fn verify_fast_succeeds() {
+        let mut rng = rand::thread_rng();
+        let sk = SigningKey::generate(&mut rng);
+        let pk = sk.verifying_key().unwrap();
+
+        let msg = b"test message";
+        let sig = sk.sign(msg).unwrap();
+
+        assert!(pk.verify_fast(msg, &sig).is_ok());
+    }
+
+    #[test]
+    fn verify_fast_fails_on_wrong_message() {
         let mut rng = rand::thread_rng();
         let sk = SigningKey::generate(&mut rng);
         let pk = sk.verifying_key().unwrap();
 
         let sig = sk.sign(b"correct").unwrap();
-        assert!(pk.verify_all(b"wrong", &sig).is_err());
+        assert!(pk.verify_fast(b"wrong", &sig).is_err());
     }
 
     #[test]
@@ -402,6 +447,42 @@ mod tests {
         assert!(SigningKey::from_seed_slice(&[0u8; 31]).is_err());
         assert!(SigningKey::from_seed_slice(&[0u8; 33]).is_err());
         assert!(SigningKey::from_seed_slice(&[]).is_err());
+    }
+
+    #[test]
+    fn deterministic_signing_keygen_test_vector() {
+        // pinned test vector: if this fails after a dependency upgrade,
+        // seed → signing key derivation has changed. this is a breaking change.
+        let seed = [0xABu8; SEED_SIZE];
+        let sk = SigningKey::from_seed(&seed);
+        let sk_bytes = sk.to_bytes();
+
+        // pin ed25519 seed (first 8 bytes of signing key)
+        assert_eq!(
+            &sk_bytes[..8],
+            &[0x48, 0xa2, 0xa3, 0x86, 0x75, 0x42, 0x50, 0xca],
+            "ed25519 seed derivation changed — this is a breaking change"
+        );
+
+        // pin falcon sk tail (last 8 bytes of signing key)
+        assert_eq!(
+            &sk_bytes[sk_bytes.len() - 8..],
+            &[0xf3, 0x21, 0xf7, 0xef, 0x00, 0xf3, 0x1a, 0x18],
+            "falcon sk derivation changed — this is a breaking change"
+        );
+
+        // pin verifying key (first 8 bytes = ed25519 pk)
+        let vk = sk.verifying_key().unwrap();
+        let vk_bytes = vk.to_bytes();
+        assert_eq!(
+            &vk_bytes[..8],
+            &[0x33, 0xcf, 0xdf, 0x41, 0xa4, 0xfb, 0x67, 0x2f],
+            "verifying key derivation changed — this is a breaking change"
+        );
+
+        // stability: same seed always produces same keys
+        let sk2 = SigningKey::from_seed(&seed);
+        assert_eq!(sk.to_bytes(), sk2.to_bytes());
     }
 
     #[test]

@@ -969,6 +969,7 @@ dependencies = [
  "sp-core",
  "sp-crypto-hashing",
  "sp-runtime",
+ "subtle",
  "x25519-dalek",
  "zeroize",
 ]

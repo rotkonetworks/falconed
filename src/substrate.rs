@@ -270,24 +270,29 @@ impl TraitSignature for Signature {}
 impl sp_runtime::traits::Verify for Signature {
     type Signer = Public;
 
+    /// **not implementable**: falconed signatures require the full 2145-byte
+    /// `Public` key for verification, but this trait only provides an
+    /// `AccountId32` (a 32-byte blake2 hash). it is impossible to recover
+    /// the public key from its hash.
+    ///
+    /// runtimes MUST use [`Pair::verify_with_public`] instead, resolving
+    /// `AccountId32` → `Public` from on-chain storage before verifying.
+    ///
+    /// # panics
+    ///
+    /// always panics. this is intentional: a silent `false` would cause
+    /// valid transactions to be silently rejected with no diagnostic.
+    /// a panic makes the misuse immediately visible during development.
     fn verify<L: sp_runtime::traits::Lazy<[u8]>>(
         &self,
-        mut msg: L,
-        signer: &sp_core::crypto::AccountId32,
+        _msg: L,
+        _signer: &sp_core::crypto::AccountId32,
     ) -> bool {
-        // we can't verify directly from AccountId32 (it's a hash).
-        // the runtime must resolve AccountId32 → Public via storage,
-        // then call Pair::verify. this impl exists so the type system
-        // is satisfied; actual verification goes through the Pair path.
-        //
-        // however, for MultiSignature compatibility, we attempt to verify
-        // against all known crypto schemes — but falconed signatures are
-        // only valid when the full Public is available, so we return false
-        // here. the runtime should use a custom SignedExtension or
-        // CheckedExtrinsic that resolves the full public key.
-        let _ = msg.get();
-        let _ = signer;
-        false
+        panic!(
+            "falconed::substrate::Signature::verify() cannot verify from AccountId32. \
+             Use Pair::verify_with_public() with the full Public key instead. \
+             See the substrate module docs for the correct verification path."
+        );
     }
 }
 
@@ -306,6 +311,11 @@ pub struct Pair {
     public_bytes: [u8; PUBLIC_IDENTITY_SIZE],
 }
 
+/// clone is required by the `sp_core::Pair` trait bound.
+///
+/// **security warning**: cloning copies secret key material. avoid holding
+/// multiple copies of a `Pair` — clone only when required by substrate APIs,
+/// and drop the clone as soon as possible.
 impl Clone for Pair {
     fn clone(&self) -> Self {
         Self {
@@ -315,6 +325,25 @@ impl Clone for Pair {
         }
     }
 }
+
+impl Drop for Pair {
+    fn drop(&mut self) {
+        #[cfg(feature = "zeroize")]
+        {
+            zeroize::Zeroize::zeroize(&mut self.seed);
+            zeroize::Zeroize::zeroize(&mut self.signing_key_bytes);
+        }
+        #[cfg(not(feature = "zeroize"))]
+        {
+            crate::zeroize_bytes(&mut self.seed);
+            crate::zeroize_bytes(&mut self.signing_key_bytes);
+        }
+        // public_bytes is public material, no need to zeroize
+    }
+}
+
+#[cfg(feature = "zeroize")]
+impl zeroize::ZeroizeOnDrop for Pair {}
 
 impl CryptoType for Pair {
     type Pair = Pair;
@@ -407,6 +436,9 @@ impl TraitPair for Pair {
     }
 
     fn to_raw_vec(&self) -> Vec<u8> {
+        // WARNING: returns the master seed as an unzeroized Vec.
+        // callers MUST zeroize this Vec when done (e.g. via zeroize::Zeroize).
+        // required by the sp_core::Pair trait.
         self.seed.to_vec()
     }
 }

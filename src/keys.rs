@@ -93,6 +93,42 @@ impl SpendingKey {
         &self.seed
     }
 
+    /// consume the spending key, zeroize the seed, and return the
+    /// component keys.
+    ///
+    /// use this when you need to derive keys once at startup and
+    /// then hold only the narrower capabilities in memory. the master
+    /// seed is zeroized before this method returns.
+    ///
+    /// ```
+    /// use falconed::SpendingKey;
+    /// use rand_core::OsRng;
+    ///
+    /// let sk = SpendingKey::generate(&mut OsRng);
+    /// let (signing, viewing) = sk.into_keys();
+    /// // seed is gone — only signing + viewing keys remain
+    /// ```
+    pub fn into_keys(mut self) -> (SigningKey, ViewingKey) {
+        // zeroize seed before moving out the keys
+        #[cfg(feature = "zeroize")]
+        {
+            zeroize::Zeroize::zeroize(&mut self.seed);
+        }
+        #[cfg(not(feature = "zeroize"))]
+        {
+            crate::zeroize_bytes(&mut self.seed);
+        }
+
+        // wrap in ManuallyDrop to prevent Drop from running on the
+        // consumed struct (which would double-zeroize and drop moved fields).
+        // ptr::read moves the fields out without running their destructors.
+        let this = core::mem::ManuallyDrop::new(self);
+        let signing_key = unsafe { core::ptr::read(&this.signing_key) };
+        let viewing_key = unsafe { core::ptr::read(&this.viewing_key) };
+
+        (signing_key, viewing_key)
+    }
+
     /// borrow the inner signing key.
     pub fn signing_key(&self) -> &SigningKey {
         &self.signing_key
@@ -143,10 +179,14 @@ impl SpendingKey {
 impl Drop for SpendingKey {
     fn drop(&mut self) {
         // zeroize the seed; inner keys handle their own drop
-        for byte in self.seed.iter_mut() {
-            unsafe { core::ptr::write_volatile(byte, 0) };
+        #[cfg(feature = "zeroize")]
+        {
+            zeroize::Zeroize::zeroize(&mut self.seed);
         }
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(feature = "zeroize"))]
+        {
+            crate::zeroize_bytes(&mut self.seed);
+        }
     }
 }
 
@@ -221,8 +261,15 @@ impl FullViewingKey {
         self.verifying_key.verify(msg, sig)
     }
 
+    /// verify a signature, short-circuiting on first failure.
+    /// delegates to [`VerifyingKey::verify_fast`].
+    pub fn verify_fast(&self, msg: &[u8], sig: &Signature) -> Result<(), Error> {
+        self.verifying_key.verify_fast(msg, sig)
+    }
+
     /// verify a signature, always checking both components.
-    /// delegates to [`VerifyingKey::verify_all`].
+    #[deprecated(since = "0.2.0", note = "use verify() which now always checks both components")]
+    #[allow(deprecated)]
     pub fn verify_all(&self, msg: &[u8], sig: &Signature) -> Result<(), Error> {
         self.verifying_key.verify_all(msg, sig)
     }
@@ -323,6 +370,29 @@ mod tests {
             sk.encryption_public_key().to_bytes(),
             fvk.encryption_public_key().to_bytes(),
         );
+    }
+
+    #[test]
+    fn into_keys_matches_accessors() {
+        let seed = [88u8; SEED_SIZE];
+        let sk = SpendingKey::from_seed(&seed);
+        let expected_signing = sk.signing_key().to_bytes();
+        let expected_viewing = sk.viewing_key().to_bytes();
+
+        let (signing, viewing) = sk.into_keys();
+        assert_eq!(signing.to_bytes(), expected_signing);
+        assert_eq!(viewing.to_bytes(), expected_viewing);
+    }
+
+    #[test]
+    fn into_keys_sign_verify() {
+        let seed = [99u8; SEED_SIZE];
+        let sk = SpendingKey::from_seed(&seed);
+        let vk_before = sk.verifying_key().unwrap();
+
+        let (signing, _viewing) = sk.into_keys();
+        let sig = signing.sign(b"after into_keys").unwrap();
+        assert!(vk_before.verify(b"after into_keys", &sig).is_ok());
     }
 
     #[test]

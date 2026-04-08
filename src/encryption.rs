@@ -32,7 +32,8 @@
 //!
 //! **KEM combiner**: the hybrid KEM combiner hashes both shared secrets together
 //! with full transcript binding (all public keys and ciphertexts) to ensure both
-//! components contribute to the final shared secret.
+//! components contribute to the final shared secret. the ml-kem shared secret
+//! is placed first in the KDF input for FIPS SP 800-56Cr2 alignment.
 //!
 //! **key commitment**: encrypted messages include a key commitment tag that
 //! prevents invisible salamander attacks (where a single ciphertext decrypts
@@ -62,6 +63,7 @@ use ml_kem::kem::{Decapsulate, Encapsulate};
 use ml_kem::{Ciphertext, EncodedSizeUser, KemCore, MlKem768};
 use ml_kem::array::typenum::Unsigned;
 use sha2::{Digest, Sha512};
+use subtle::ConstantTimeEq;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};
 
 // --- size constants (all derived from the type system) ---
@@ -131,33 +133,14 @@ impl Drop for SharedSecret {
 
 // --- utility functions ---
 
-/// zeroize a byte slice via volatile writes + compiler fence.
-///
-/// this is a best-effort fallback for when the `zeroize` crate feature
-/// is not enabled. volatile writes are not formally guaranteed by rust's
-/// memory model to prevent elision, but work in practice on current compilers.
+/// re-export shared zeroize_bytes for local use.
 fn zeroize_bytes(bytes: &mut [u8]) {
-    for byte in bytes.iter_mut() {
-        unsafe { core::ptr::write_volatile(byte, 0) };
-    }
-    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    crate::zeroize_bytes(bytes)
 }
 
-/// domain-separated KDF: `SHA-512(len(tag) || tag || input)`.
-///
-/// the length prefix prevents ambiguity between tags that are prefixes
-/// of each other. tags must be <= 255 bytes (enforced by taking `&[u8; N]`
-/// through the call sites, but asserted here defensively).
+/// re-export shared domain KDF for local use.
 fn domain_kdf(tag: &[u8], input: &[u8]) -> [u8; 64] {
-    debug_assert!(tag.len() <= 255, "domain tag exceeds u8 length prefix");
-    let hash = Sha512::new()
-        .chain_update(&[tag.len() as u8])
-        .chain_update(tag)
-        .chain_update(input)
-        .finalize();
-    let mut out = [0u8; 64];
-    out.copy_from_slice(&hash);
-    out
+    crate::domain_kdf(tag, input)
 }
 
 /// compute a key commitment tag.
@@ -165,20 +148,25 @@ fn domain_kdf(tag: &[u8], input: &[u8]) -> [u8; 64] {
 /// binds the shared secret, nonce, and capsule to prevent invisible
 /// salamander attacks where a single ciphertext decrypts to different
 /// plaintexts under different keys.
+///
+/// uses length-prefixed domain tag for consistency with the rest of the
+/// KDF constructions in this crate.
 fn key_commitment(
     shared_secret: &[u8; SHARED_SECRET_SIZE],
     nonce: &[u8; NONCE_SIZE],
     capsule_bytes: &[u8; CAPSULE_SIZE],
 ) -> [u8; KEY_COMMITMENT_SIZE] {
+    let tag = b"falconed-key-commit";
     let hash = Sha512::new()
-        .chain_update(b"falconed-key-commit")
+        .chain_update(&[tag.len() as u8])
+        .chain_update(tag)
         .chain_update(shared_secret)
         .chain_update(nonce)
         .chain_update(capsule_bytes)
         .finalize();
-    let mut tag = [0u8; KEY_COMMITMENT_SIZE];
-    tag.copy_from_slice(&hash[..KEY_COMMITMENT_SIZE]);
-    tag
+    let mut out = [0u8; KEY_COMMITMENT_SIZE];
+    out.copy_from_slice(&hash[..KEY_COMMITMENT_SIZE]);
+    out
 }
 
 // --- public types ---
@@ -279,22 +267,32 @@ impl ViewingKey {
     /// combines x25519 ECDH + ml-kem decapsulation, then hashes both
     /// shared secrets together with full transcript binding.
     fn decapsulate(&self, capsule: &Capsule) -> Result<SharedSecret, Error> {
+        // run both KEM components unconditionally to avoid timing leaks
+        // that would distinguish "non-contributory x25519" from "bad ml-kem".
         let x_shared = self.x25519.diffie_hellman(&capsule.x25519_ephemeral);
-
-        if !x_shared.was_contributory() {
-            return Err(Error::DecryptionFailed);
-        }
+        let x_ok = x_shared.was_contributory();
 
         let x_static_pk = X25519PublicKey::from(&self.x25519);
         let mlkem_ek = self.mlkem_dk.encapsulation_key();
 
-        let mlkem_shared = self.mlkem_dk.decapsulate(&capsule.mlkem_ciphertext)
-            .map_err(|_| Error::DecryptionFailed)?;
+        let mlkem_result = self.mlkem_dk.decapsulate(&capsule.mlkem_ciphertext);
 
+        // check both after running both
+        if !x_ok {
+            return Err(Error::DecryptionFailed);
+        }
+        let mlkem_shared = mlkem_result.map_err(|_| Error::DecryptionFailed)?;
+
+        // ml-kem shared secret first (conservative ordering).
+        // includes x25519 ciphertext + public key per X-Wing construction.
+        // ml-kem ek + ct included for full transcript binding (conservative).
+        // length-prefixed domain tag for consistency with crate-wide KDF design.
+        let kem_tag = b"falconed-hybrid-kem";
         let combined = Sha512::new()
-            .chain_update(b"falconed-hybrid-kem")
-            .chain_update(x_shared.as_bytes())
+            .chain_update(&[kem_tag.len() as u8])
+            .chain_update(kem_tag)
             .chain_update(&mlkem_shared)
+            .chain_update(x_shared.as_bytes())
             .chain_update(capsule.x25519_ephemeral.as_bytes())
             .chain_update(x_static_pk.as_bytes())
             .chain_update(mlkem_ek.as_bytes().as_slice())
@@ -345,10 +343,28 @@ impl ViewingKey {
 impl Drop for ViewingKey {
     fn drop(&mut self) {
         // StaticSecret handles its own zeroization via x25519-dalek.
-        // zeroize the ml-kem decapsulation key by overwriting with a zeroed key.
-        let zeroed = MlKemDk::from_bytes(&ml_kem::Encoded::<MlKemDk>::default());
-        unsafe { core::ptr::write_volatile(&mut self.mlkem_dk as *mut MlKemDk, zeroed) };
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // zeroize the ml-kem decapsulation key byte-by-byte through its
+        // encoded representation. this avoids struct-level write_volatile
+        // which may not cover padding or internal layout.
+        #[cfg(feature = "zeroize")]
+        {
+            // zeroize the encoded bytes directly
+            let dk_bytes = self.mlkem_dk.as_bytes();
+            let ptr = dk_bytes.as_ptr() as *mut u8;
+            let len = dk_bytes.len();
+            let slice = unsafe { core::slice::from_raw_parts_mut(ptr, len) };
+            zeroize::Zeroize::zeroize(slice);
+        }
+        #[cfg(not(feature = "zeroize"))]
+        {
+            let dk_bytes = self.mlkem_dk.as_bytes();
+            let ptr = dk_bytes.as_ptr() as *mut u8;
+            let len = dk_bytes.len();
+            for i in 0..len {
+                unsafe { core::ptr::write_volatile(ptr.add(i), 0) };
+            }
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
@@ -374,10 +390,14 @@ impl EncryptionPublicKey {
         let (mlkem_ct, mlkem_shared) = self.mlkem_ek.encapsulate(rng)
             .map_err(|_| Error::EncryptionFailed)?;
 
+        // ml-kem shared secret first (conservative ordering).
+        // length-prefixed domain tag for consistency with crate-wide KDF design.
+        let kem_tag = b"falconed-hybrid-kem";
         let combined = Sha512::new()
-            .chain_update(b"falconed-hybrid-kem")
-            .chain_update(x_shared.as_bytes())
+            .chain_update(&[kem_tag.len() as u8])
+            .chain_update(kem_tag)
             .chain_update(&mlkem_shared)
+            .chain_update(x_shared.as_bytes())
             .chain_update(x_ephemeral_pk.as_bytes())
             .chain_update(self.x25519.as_bytes())
             .chain_update(self.mlkem_ek.as_bytes().as_slice())
@@ -567,7 +587,7 @@ pub fn open(
 
     let capsule_bytes = message.capsule.to_bytes();
     let expected_kc = key_commitment(&secret.0, &message.nonce, &capsule_bytes);
-    if expected_kc != message.key_commitment {
+    if expected_kc.ct_eq(&message.key_commitment).unwrap_u8() != 1 {
         return Err(Error::DecryptionFailed);
     }
 

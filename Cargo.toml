@@ -11,7 +11,7 @@ categories = ["cryptography", "no-std"]
 readme = "README.md"
 
 [features]
-default = ["std"]
+default = ["std", "zeroize"]
 std = ["ed25519-dalek/std"]
 serde = ["dep:serde", "ed25519-dalek/serde"]
 zeroize = ["dep:zeroize", "ed25519-dalek/zeroize"]
@@ -24,12 +24,17 @@ substrate = ["std", "dep:sp-core", "dep:sp-runtime", "dep:sp-crypto-hashing", "d
 
 [dependencies]
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
-ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"] }
-fn-dsa = { version = "0.3", default-features = false }
-ml-kem = { version = "0.2", default-features = false }
-rand_chacha = { version = "0.3", default-features = false }
+# pinned: key derivation depends on internal rng consumption patterns.
+# changing these versions may silently change derived keys from the same seed.
+# ALWAYS verify test vectors (deterministic_signing_keygen_test_vector,
+# deterministic_keygen_test_vector) before upgrading.
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["rand_core"] }
+fn-dsa = { version = "=0.3.0", default-features = false }
+ml-kem = { version = "=0.2.3", default-features = false }
+rand_chacha = { version = "=0.3.1", default-features = false }
 rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
 sha2 = { version = "0.10", default-features = false }
+subtle = { version = "2", default-features = false }
 signature = { version = "2", default-features = false, features = ["rand_core"] }
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 
